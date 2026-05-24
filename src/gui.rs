@@ -20,7 +20,6 @@ const DEFAULT_WIDTH: usize = 960;
 const DEFAULT_HEIGHT: usize = 640;
 const MIN_WIDTH: usize = 420;
 const MIN_HEIGHT: usize = 240;
-const TITLE_HEIGHT: usize = 32;
 const MENU_HEIGHT: usize = 30;
 const MENU_ITEM_HEIGHT: usize = 26;
 const MENU_SEPARATOR_HEIGHT: usize = 7;
@@ -37,8 +36,6 @@ const COLOR_WINDOW: u32 = 0x00f0f0f0;
 const COLOR_TEXT_AREA: u32 = 0x00ffffff;
 const COLOR_STATUS: u32 = 0x00f0f0f0;
 const COLOR_BORDER: u32 = 0x00d4d4d4;
-const COLOR_TITLE: u32 = 0x00ffffff;
-const COLOR_TITLE_BUTTON_HOVER: u32 = 0x00e5e5e5;
 const COLOR_MENU_OPEN: u32 = 0x00dbeeff;
 const COLOR_DROPDOWN: u32 = 0x00f8f8f8;
 const COLOR_SCROLLBAR: u32 = 0x00e6e6e6;
@@ -881,7 +878,6 @@ fn render_frame_with_state(
 }
 
 fn draw_chrome(canvas: &mut Canvas, state: &NotepadUiState, gui_state: &GuiState) {
-    draw_title_bar(canvas, state, &gui_state.fonts);
     let menu_top = menu_top();
     canvas.fill_rect(0, menu_top, canvas.width, MENU_HEIGHT, COLOR_WINDOW);
     canvas.line(
@@ -942,32 +938,6 @@ fn draw_chrome(canvas: &mut Canvas, state: &NotepadUiState, gui_state: &GuiState
             }
         }
     }
-}
-
-fn draw_title_bar(canvas: &mut Canvas, state: &NotepadUiState, fonts: &FontStack) {
-    canvas.fill_rect(0, 0, canvas.width, TITLE_HEIGHT, COLOR_TITLE);
-    canvas.line(0, TITLE_HEIGHT, canvas.width, TITLE_HEIGHT, COLOR_BORDER);
-
-    canvas.fill_rect(8, 8, 16, 16, 0x00007acc);
-    canvas.fill_rect(11, 12, 10, 2, 0x00ffffff);
-    canvas.fill_rect(11, 16, 10, 2, 0x00ffffff);
-    canvas.fill_rect(11, 20, 7, 2, 0x00ffffff);
-    canvas.text(32, 7, &state.title(), COLOR_TEXT, TextRole::Ui, fonts);
-
-    let button_width = 46usize;
-    let close_x = canvas.width.saturating_sub(button_width);
-    let max_x = close_x.saturating_sub(button_width);
-    let min_x = max_x.saturating_sub(button_width);
-    canvas.fill_rect(
-        close_x,
-        0,
-        button_width,
-        TITLE_HEIGHT,
-        COLOR_TITLE_BUTTON_HOVER,
-    );
-    canvas.text(min_x + 18, 7, "_", COLOR_TEXT, TextRole::Ui, fonts);
-    canvas.text(max_x + 17, 7, "□", COLOR_TEXT, TextRole::Ui, fonts);
-    canvas.text(close_x + 18, 7, "×", COLOR_TEXT, TextRole::Ui, fonts);
 }
 
 fn draw_menu_popup(canvas: &mut Canvas, app: &BlitzApp, menu_index: usize, fonts: &FontStack) {
@@ -1488,15 +1458,15 @@ fn menu_row_hit(
 }
 
 fn menu_top() -> usize {
-    TITLE_HEIGHT
+    0
 }
 
 fn dropdown_top() -> usize {
-    TITLE_HEIGHT + MENU_HEIGHT
+    MENU_HEIGHT
 }
 
 fn text_top() -> usize {
-    TITLE_HEIGHT + MENU_HEIGHT + 1
+    MENU_HEIGHT + 1
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1833,7 +1803,6 @@ mod tests {
         let app = BlitzApp::new(EditorSettings::default());
         let frame = render_frame(&app, DEFAULT_WIDTH, DEFAULT_HEIGHT).expect("render");
 
-        assert_eq!(frame.pixels[pixel_index(&frame, 5, 5)], COLOR_TITLE);
         assert_eq!(
             frame.pixels[pixel_index(&frame, 5, menu_top() + 5)],
             COLOR_WINDOW
