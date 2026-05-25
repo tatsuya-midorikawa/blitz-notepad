@@ -1,11 +1,13 @@
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use time::format_description::FormatItem;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
 use crate::document::TextEdit;
+use crate::encoding::TextEncoding;
+use crate::line_index::LineEnding;
 use crate::settings::EditorSettings;
 use crate::ui::{default_ui_state, NotepadUiState};
 use crate::{Document, Result};
@@ -20,6 +22,15 @@ pub struct BlitzApp {
     caret_offset: usize,
     selection: Option<Range<usize>>,
     clipboard_has_text: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SaveSnapshot {
+    pub document: Document,
+    pub path: PathBuf,
+    pub encoding: TextEncoding,
+    pub line_ending: LineEnding,
+    pub generation: u64,
 }
 
 impl BlitzApp {
@@ -127,10 +138,7 @@ impl BlitzApp {
 
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection.as_ref()?;
-        self.document
-            .text_lossy()
-            .get(selection.clone())
-            .map(ToOwned::to_owned)
+        self.document.text_range_lossy(selection.clone()).ok()
     }
 
     pub fn cut_selection(&mut self) -> Result<Option<String>> {
@@ -214,12 +222,10 @@ impl BlitzApp {
         if one_based_line == 0 {
             return Ok(false);
         }
-        let text = self.document.text_lossy();
-        let spans = line_spans(&text);
-        let Some(span) = spans.get(one_based_line - 1) else {
+        let Some(offset) = self.document.line_start(one_based_line - 1) else {
             return Ok(false);
         };
-        self.set_caret_offset(span.start)?;
+        self.set_caret_offset(offset)?;
         Ok(true)
     }
 
@@ -250,15 +256,9 @@ impl BlitzApp {
             return Ok(true);
         }
 
-        let text = self.document.text_lossy();
-        let Some(next_character) = text
-            .get(self.caret_offset..)
-            .and_then(|tail| tail.chars().next())
-        else {
+        let Some(next_offset) = self.document.next_char_offset(self.caret_offset)? else {
             return Ok(false);
         };
-
-        let next_offset = self.caret_offset + next_character.len_utf8();
         self.document.delete_range(self.caret_offset..next_offset)?;
         Ok(true)
     }
@@ -268,8 +268,7 @@ impl BlitzApp {
             return Ok(true);
         }
 
-        let text = self.document.text_lossy();
-        let Some(previous_offset) = previous_char_offset(&text, self.caret_offset) else {
+        let Some(previous_offset) = self.document.previous_char_offset(self.caret_offset)? else {
             return Ok(false);
         };
 
@@ -280,33 +279,31 @@ impl BlitzApp {
     }
 
     pub fn move_left(&mut self) -> Result<()> {
-        let text = self.document.text_lossy();
-        if let Some(previous_offset) = previous_char_offset(&text, self.caret_offset) {
+        if let Some(previous_offset) = self.document.previous_char_offset(self.caret_offset)? {
             self.set_caret_offset(previous_offset)?;
         }
         Ok(())
     }
 
     pub fn move_right(&mut self) -> Result<()> {
-        let text = self.document.text_lossy();
-        if let Some(next_offset) = next_char_offset(&text, self.caret_offset) {
+        if let Some(next_offset) = self.document.next_char_offset(self.caret_offset)? {
             self.set_caret_offset(next_offset)?;
         }
         Ok(())
     }
 
     pub fn move_line_start(&mut self) -> Result<()> {
-        let text = self.document.text_lossy();
-        let spans = line_spans(&text);
-        let line_index = line_index_for_offset(&spans, self.caret_offset);
-        self.set_caret_offset(spans[line_index].start)
+        let range = self
+            .document
+            .line_content_range_for_offset(self.caret_offset)?;
+        self.set_caret_offset(range.start)
     }
 
     pub fn move_line_end(&mut self) -> Result<()> {
-        let text = self.document.text_lossy();
-        let spans = line_spans(&text);
-        let line_index = line_index_for_offset(&spans, self.caret_offset);
-        self.set_caret_offset(spans[line_index].content_end)
+        let range = self
+            .document
+            .line_content_range_for_offset(self.caret_offset)?;
+        self.set_caret_offset(range.end)
     }
 
     pub fn move_up(&mut self) -> Result<()> {
@@ -332,6 +329,20 @@ impl BlitzApp {
         Ok(true)
     }
 
+    pub(crate) fn save_snapshot(&self) -> Option<SaveSnapshot> {
+        Some(SaveSnapshot {
+            document: self.document.clone(),
+            path: self.document.path()?.to_path_buf(),
+            encoding: self.document.encoding(),
+            line_ending: self.document.line_ending(),
+            generation: self.document.change_generation(),
+        })
+    }
+
+    pub(crate) fn complete_save_snapshot(&mut self, generation: u64, saved_len: u64) -> bool {
+        self.document.mark_saved_generation(generation, saved_len)
+    }
+
     pub fn save_as_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let encoding = self.document.encoding();
         let line_ending = self.document.line_ending();
@@ -339,24 +350,17 @@ impl BlitzApp {
     }
 
     fn move_vertical(&mut self, direction: isize) -> Result<()> {
-        let text = self.document.text_lossy();
-        let spans = line_spans(&text);
-        let line_index = line_index_for_offset(&spans, self.caret_offset);
+        let line_index = self.document.line_for_offset(self.caret_offset)?;
         let target_line = match direction {
             -1 if line_index > 0 => line_index - 1,
-            1 if line_index + 1 < spans.len() => line_index + 1,
+            1 if line_index + 1 < self.document.line_count() => line_index + 1,
             _ => return Ok(()),
         };
 
-        let current_span = spans[line_index];
-        let preferred_column = text[current_span.start..self.caret_offset].chars().count();
-        let target_span = spans[target_line];
-        let offset = offset_for_char_column(
-            &text,
-            target_span.start,
-            target_span.content_end,
-            preferred_column,
-        );
+        let preferred_column = self.document.char_column_for_offset(self.caret_offset)?;
+        let offset = self
+            .document
+            .offset_for_char_column(target_line, preferred_column)?;
         self.set_caret_offset(offset)
     }
 
@@ -404,76 +408,6 @@ impl BlitzApp {
     pub fn toggle_status_bar(&mut self) {
         self.settings.status_bar_visible = !self.settings.status_bar_visible;
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LineSpan {
-    start: usize,
-    content_end: usize,
-}
-
-fn previous_char_offset(text: &str, offset: usize) -> Option<usize> {
-    text.get(..offset)?
-        .char_indices()
-        .last()
-        .map(|(index, _)| index)
-}
-
-fn next_char_offset(text: &str, offset: usize) -> Option<usize> {
-    text.get(offset..)?
-        .chars()
-        .next()
-        .map(|character| offset + character.len_utf8())
-}
-
-fn line_spans(text: &str) -> Vec<LineSpan> {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut start = 0usize;
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
-                spans.push(LineSpan {
-                    start,
-                    content_end: index,
-                });
-                index += 2;
-                start = index;
-            }
-            b'\r' | b'\n' => {
-                spans.push(LineSpan {
-                    start,
-                    content_end: index,
-                });
-                index += 1;
-                start = index;
-            }
-            _ => index += 1,
-        }
-    }
-
-    spans.push(LineSpan {
-        start,
-        content_end: bytes.len(),
-    });
-    spans
-}
-
-fn line_index_for_offset(spans: &[LineSpan], offset: usize) -> usize {
-    spans
-        .partition_point(|span| span.start <= offset)
-        .saturating_sub(1)
-        .min(spans.len().saturating_sub(1))
-}
-
-fn offset_for_char_column(text: &str, start: usize, content_end: usize, column: usize) -> usize {
-    text[start..content_end]
-        .char_indices()
-        .nth(column)
-        .map(|(index, _)| start + index)
-        .unwrap_or(content_end)
 }
 
 fn find_range(
@@ -638,5 +572,30 @@ mod tests {
                 .line,
             2
         );
+    }
+
+    #[test]
+    fn save_snapshot_completion_clears_dirty_only_for_same_generation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("snapshot.txt");
+        let mut app = BlitzApp::default();
+        app.insert_text("alpha").expect("insert");
+        app.save_as_path(&path).expect("initial save");
+        app.insert_text(" beta").expect("edit");
+
+        let snapshot = app.save_snapshot().expect("snapshot");
+        let saved_len = snapshot
+            .document
+            .save_snapshot_to_path(&snapshot.path, snapshot.encoding, snapshot.line_ending)
+            .expect("save snapshot");
+
+        assert!(app.complete_save_snapshot(snapshot.generation, saved_len));
+        assert!(!app.document().is_dirty());
+        assert_eq!(std::fs::read(&path).expect("read"), b"alpha beta");
+
+        app.insert_text(" gamma").expect("edit again");
+        let stale_generation = snapshot.generation;
+        assert!(!app.complete_save_snapshot(stale_generation, saved_len));
+        assert!(app.document().is_dirty());
     }
 }

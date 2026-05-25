@@ -8,6 +8,17 @@ use blitz_notepad::Document;
 use tempfile::tempdir;
 
 #[test]
+fn new_untitled_document_is_clean_until_edited() {
+    let mut document = Document::new_untitled();
+
+    assert!(!document.is_dirty());
+
+    document.insert_text(0, "x").expect("insert");
+
+    assert!(document.is_dirty());
+}
+
+#[test]
 fn japanese_input_round_trips_as_utf8() {
     let directory = tempdir().expect("tempdir");
     let path = directory.path().join("japanese.txt");
@@ -71,6 +82,40 @@ fn large_file_uses_memory_map_without_crashing() {
 }
 
 #[test]
+fn visible_lines_cap_very_long_rows_for_virtual_rendering() {
+    let mut document = Document::new_untitled();
+    document
+        .insert_text(0, &"x".repeat(64 * 1024))
+        .expect("insert long line");
+
+    let line = document
+        .visible_lines(0, 1)
+        .into_iter()
+        .next()
+        .expect("visible line");
+
+    assert!(line.text.len() <= 16 * 1024);
+    assert!(line.byte_range.len() <= 16 * 1024);
+}
+
+#[test]
+fn line_index_updates_when_edit_joins_lf_into_crlf() {
+    let mut document = Document::new_untitled();
+    document.insert_text(0, "a\nb").expect("insert");
+
+    document.insert_text(1, "\r").expect("insert cr");
+
+    assert_eq!(document.text_lossy(), "a\r\nb");
+    assert_eq!(document.line_count(), 2);
+    assert_eq!(document.visible_lines(0, 2)[0].text, "a");
+    assert_eq!(document.visible_lines(0, 2)[1].text, "b");
+
+    assert!(document.undo().expect("undo"));
+    assert_eq!(document.text_lossy(), "a\nb");
+    assert_eq!(document.line_count(), 2);
+}
+
+#[test]
 fn multi_cursor_edits_apply_from_document_end() {
     let mut document = Document::new_untitled();
     document.insert_text(0, "aa bb cc").expect("insert");
@@ -106,6 +151,36 @@ fn save_as_normalizes_line_endings_and_utf8_bom() {
         fs::read(&path).expect("read"),
         b"\xEF\xBB\xBFa\r\nb\r\nc\r\n"
     );
+}
+
+#[test]
+fn streaming_utf8_save_normalizes_across_piece_boundaries() {
+    let directory = tempdir().expect("tempdir");
+    let source_path = directory.path().join("source.txt");
+    let saved_path = directory.path().join("saved.txt");
+    fs::write(&source_path, b"a\nb").expect("seed");
+    let mut document = Document::open(&source_path).expect("open");
+
+    document.insert_text(1, "\r").expect("insert cr");
+    document
+        .save_as(&saved_path, TextEncoding::Utf8, LineEnding::CrLf)
+        .expect("save");
+
+    assert_eq!(fs::read(saved_path).expect("read"), b"a\r\nb");
+}
+
+#[test]
+fn streaming_utf8_save_normalizes_trailing_cr() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("trailing-cr.txt");
+    let mut document = Document::new_untitled();
+    document.insert_text(0, "a\r").expect("insert");
+
+    document
+        .save_as(&path, TextEncoding::Utf8, LineEnding::Lf)
+        .expect("save");
+
+    assert_eq!(fs::read(path).expect("read"), b"a\n");
 }
 
 #[test]

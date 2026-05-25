@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use memchr::memchr2_iter;
 use serde::{Deserialize, Serialize};
 
@@ -31,30 +33,49 @@ impl LineEnding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineIndex {
     starts: Vec<usize>,
+    indexed_len: usize,
+    complete: bool,
 }
 
 impl LineIndex {
     pub fn build(bytes: &[u8]) -> Self {
-        let mut starts = Vec::with_capacity(bytes.len().saturating_div(80).max(1));
+        let mut starts = Vec::new();
         starts.push(0);
+        starts.extend(newline_starts(0, bytes));
 
-        let mut skip_lf_at = None;
-        for newline_index in memchr2_iter(b'\r', b'\n', bytes) {
-            if skip_lf_at == Some(newline_index) {
-                skip_lf_at = None;
-                continue;
-            }
-
-            if bytes[newline_index] == b'\r' && bytes.get(newline_index + 1) == Some(&b'\n') {
-                starts.push(newline_index + 2);
-                skip_lf_at = Some(newline_index + 1);
-            } else {
-                starts.push(newline_index + 1);
-                skip_lf_at = None;
-            }
+        Self {
+            starts,
+            indexed_len: bytes.len(),
+            complete: true,
         }
+    }
 
-        Self { starts }
+    pub fn build_prefix(bytes: &[u8], max_indexed_len: usize) -> Self {
+        let indexed_len = safe_prefix_len(bytes, max_indexed_len.min(bytes.len()));
+        let mut starts = Vec::new();
+        starts.push(0);
+        starts.extend(newline_starts(0, &bytes[..indexed_len]));
+
+        Self {
+            starts,
+            indexed_len,
+            complete: indexed_len == bytes.len(),
+        }
+    }
+
+    pub(crate) fn replace_with_starts(
+        starts: Vec<usize>,
+        indexed_len: usize,
+        complete: bool,
+    ) -> Self {
+        debug_assert!(!starts.is_empty());
+        debug_assert_eq!(starts[0], 0);
+        debug_assert!(starts.windows(2).all(|window| window[0] < window[1]));
+        Self {
+            starts,
+            indexed_len,
+            complete,
+        }
     }
 
     pub fn starts(&self) -> &[usize] {
@@ -63,6 +84,67 @@ impl LineIndex {
 
     pub fn line_count(&self) -> usize {
         self.starts.len()
+    }
+
+    pub fn indexed_len(&self) -> usize {
+        self.indexed_len
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn extend(&mut self, bytes: &[u8], additional_len: usize) {
+        if self.complete {
+            return;
+        }
+
+        let target_len = self
+            .indexed_len
+            .saturating_add(additional_len)
+            .min(bytes.len());
+        let next_indexed_len = safe_prefix_len(bytes, target_len);
+        if next_indexed_len <= self.indexed_len && target_len < bytes.len() {
+            return;
+        }
+
+        let end = if target_len == bytes.len() {
+            bytes.len()
+        } else {
+            next_indexed_len
+        };
+        if end > self.indexed_len {
+            self.starts.extend(newline_starts(
+                self.indexed_len,
+                &bytes[self.indexed_len..end],
+            ));
+            self.indexed_len = end;
+        }
+        self.complete = self.indexed_len == bytes.len();
+    }
+
+    pub fn extend_from_chunk(&mut self, chunk: &[u8], document_len: usize) {
+        if self.complete || chunk.is_empty() {
+            return;
+        }
+
+        let mut scan_len = chunk
+            .len()
+            .min(document_len.saturating_sub(self.indexed_len));
+        if self.indexed_len + scan_len < document_len
+            && scan_len > 0
+            && chunk[scan_len - 1] == b'\r'
+        {
+            scan_len -= 1;
+        }
+        if scan_len == 0 {
+            return;
+        }
+
+        self.starts
+            .extend(newline_starts(self.indexed_len, &chunk[..scan_len]));
+        self.indexed_len += scan_len;
+        self.complete = self.indexed_len == document_len;
     }
 
     pub fn line_for_offset(&self, offset: usize) -> usize {
@@ -75,18 +157,48 @@ impl LineIndex {
         self.starts.get(zero_based_line).copied()
     }
 
-    pub fn line_range(
-        &self,
-        zero_based_line: usize,
-        document_len: usize,
-    ) -> Option<std::ops::Range<usize>> {
+    pub fn line_range(&self, zero_based_line: usize, document_len: usize) -> Option<Range<usize>> {
         let start = self.line_start(zero_based_line)?;
         let end = self
             .line_start(zero_based_line + 1)
-            .unwrap_or(document_len)
+            .unwrap_or(if self.complete {
+                document_len
+            } else {
+                self.indexed_len
+            })
             .min(document_len);
         Some(start..end)
     }
+}
+
+fn safe_prefix_len(bytes: &[u8], requested_len: usize) -> usize {
+    if requested_len >= bytes.len() {
+        bytes.len()
+    } else if requested_len > 0 && bytes[requested_len - 1] == b'\r' {
+        requested_len - 1
+    } else {
+        requested_len
+    }
+}
+
+fn newline_starts(base_offset: usize, bytes: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut skip_lf_at = None;
+    for newline_index in memchr2_iter(b'\r', b'\n', bytes) {
+        if skip_lf_at == Some(newline_index) {
+            skip_lf_at = None;
+            continue;
+        }
+
+        if bytes[newline_index] == b'\r' && bytes.get(newline_index + 1) == Some(&b'\n') {
+            starts.push(base_offset + newline_index + 2);
+            skip_lf_at = Some(newline_index + 1);
+        } else {
+            starts.push(base_offset + newline_index + 1);
+            skip_lf_at = None;
+        }
+    }
+    starts
 }
 
 pub fn detect_line_ending(bytes: &[u8]) -> LineEnding {
@@ -154,6 +266,28 @@ mod tests {
         let index = LineIndex::build(b"a\r\nb\nc\rd");
         assert_eq!(index.starts(), &[0, 3, 5, 7]);
         assert_eq!(index.line_for_offset(4), 1);
+    }
+
+    #[test]
+    fn prefix_index_does_not_scan_the_whole_buffer() {
+        let index = LineIndex::build_prefix(b"a\nb\nc\nd", 4);
+
+        assert!(!index.is_complete());
+        assert_eq!(index.indexed_len(), 4);
+        assert_eq!(index.starts(), &[0, 2, 4]);
+        assert_eq!(index.line_range(2, 7), Some(4..4));
+    }
+
+    #[test]
+    fn prefix_index_extends_in_chunks() {
+        let bytes = b"a\nb\nc\nd";
+        let mut index = LineIndex::build_prefix(bytes, 2);
+
+        index.extend(bytes, 5);
+
+        assert!(index.is_complete());
+        assert_eq!(index.starts(), &[0, 2, 4, 6]);
+        assert_eq!(index.line_range(3, bytes.len()), Some(6..7));
     }
 
     #[test]

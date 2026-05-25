@@ -1,4 +1,9 @@
+use std::fs;
+use std::io::Write;
+
+use blitz_notepad::document::LoadMode;
 use blitz_notepad::encoding::TextEncoding;
+use blitz_notepad::gui::render_frame;
 use blitz_notepad::line_index::LineEnding;
 use blitz_notepad::settings::EditorSettings;
 use blitz_notepad::ui::{default_ui_state, FontDialogModel, MENU_BAR};
@@ -13,11 +18,26 @@ fn ui_snapshot_matches_notepad_shell() {
     assert_eq!(
         state.shell_snapshot(),
         vec![
-            "*Untitled - Notepad".to_owned(),
+            "Untitled - Notepad".to_owned(),
             "File Edit Format View Help".to_owned(),
             "Ln 1, Col 1 | 100% | Windows (CRLF) | UTF-8".to_owned(),
         ]
     );
+}
+
+#[test]
+fn new_untitled_ui_is_clean_until_edited() {
+    let mut app = BlitzApp::default();
+
+    let initial = app.ui_state().expect("ui state");
+    assert!(!app.document().is_dirty());
+    assert_eq!(initial.title(), "Untitled - Notepad");
+
+    app.insert_text("x").expect("edit");
+
+    let edited = app.ui_state().expect("ui state");
+    assert!(app.document().is_dirty());
+    assert_eq!(edited.title(), "*Untitled - Notepad");
 }
 
 #[test]
@@ -28,6 +48,33 @@ fn app_ui_handles_japanese_input_without_mojibake() {
 
     assert_eq!(app.document().text_lossy(), "日本語");
     assert_eq!(state.status_cells()[0], "Ln 1, Col 4");
+}
+
+#[test]
+fn ui_render_handles_sparse_500mb_file() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("huge-ui.txt");
+    let mut file = fs::File::create(&path).expect("create");
+    for index in 0..512 {
+        writeln!(file, "visible line {index:04}").expect("seed");
+    }
+    file.set_len(500 * 1024 * 1024 + 1)
+        .expect("sparse huge file");
+    drop(file);
+
+    let app = BlitzApp::open(&path, EditorSettings::default()).expect("open huge file");
+    let state = app.ui_state().expect("ui state");
+    let frame = render_frame(&app, 800, 480).expect("render huge file");
+
+    assert_eq!(app.document().load_mode(), LoadMode::MemoryMapped);
+    assert_eq!(state.status_cells()[0], "Ln 1, Col 1");
+    assert_eq!(
+        app.document().visible_lines(0, 1)[0].text,
+        "visible line 0000"
+    );
+    assert_eq!(frame.width, 800);
+    assert_eq!(frame.height, 480);
+    assert!(frame.pixels.iter().any(|pixel| *pixel != 0x00f0f0f0));
 }
 
 #[test]

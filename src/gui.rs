@@ -1,10 +1,13 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use ab_glyph::{point, Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont};
@@ -31,6 +34,9 @@ const EDITOR_LINE_HEIGHT: usize = 24;
 const CARET_HEIGHT: usize = 22;
 const UI_FONT_SIZE: f32 = 15.0;
 const EDITOR_FONT_SIZE: f32 = 18.0;
+const WHEEL_LINES: isize = 3;
+const HORIZONTAL_WHEEL_BYTES: isize = 96;
+const MIN_SCROLL_THUMB: usize = 32;
 
 const COLOR_WINDOW: u32 = 0x00f0f0f0;
 const COLOR_TEXT_AREA: u32 = 0x00ffffff;
@@ -94,6 +100,8 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
     let input_queue = Rc::new(RefCell::new(Vec::new()));
     window.set_input_callback(Box::new(TextInput::new(Rc::clone(&input_queue))));
     let mut remaining_frames = options.smoke_frames;
+    let mut frame_cache: Option<CachedFrame> = None;
+    let mut last_title = String::new();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         app.set_clipboard_has_text(!gui_state.clipboard.is_empty());
@@ -102,18 +110,37 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
         }
         handle_keys(&window, &mut app, &mut gui_state)?;
         handle_text_input(&input_queue, &window, &mut app, &mut gui_state)?;
+        poll_save_job(&mut app, &mut gui_state);
 
         let (width, height) = window.get_size();
-        let frame = render_frame_with_state(
-            &app,
-            width.max(MIN_WIDTH),
-            height.max(MIN_HEIGHT),
-            &gui_state,
-        )?;
+        let width = width.max(MIN_WIDTH);
+        let height = height.max(MIN_HEIGHT);
+        handle_scroll_wheel(&window, &app, &mut gui_state, width, height)?;
+        gui_state.follow_caret_if_moved(&app, width, height)?;
+        app.document().refresh_line_index();
+        let state = app.ui_state()?;
+        let signature = frame_signature(&app, &state, width, height, &gui_state);
+        if frame_cache
+            .as_ref()
+            .is_none_or(|cache| cache.signature != signature)
+        {
+            frame_cache = Some(CachedFrame {
+                frame: render_frame_with_state(&app, &state, width, height, &gui_state)?,
+                signature,
+            });
+        }
+        let frame = &frame_cache
+            .as_ref()
+            .expect("frame cache is initialized")
+            .frame;
         window
             .update_with_buffer(&frame.pixels, frame.width, frame.height)
             .map_err(|error| BlitzError::Window(error.to_string()))?;
-        window.set_title(&app.ui_state()?.title());
+        let title = state.title();
+        if title != last_title {
+            window.set_title(&title);
+            last_title = title;
+        }
 
         if let Some(frames) = remaining_frames.as_mut() {
             *frames = frames.saturating_sub(1);
@@ -132,6 +159,11 @@ struct GuiState {
     last_search: Option<SearchSpec>,
     clipboard: String,
     mouse_was_down: bool,
+    first_visible_line: usize,
+    horizontal_offset: usize,
+    last_caret_offset: usize,
+    scroll_drag: Option<ScrollDrag>,
+    save_job: Option<SaveJob>,
     fonts: FontStack,
 }
 
@@ -144,11 +176,130 @@ impl GuiState {
             last_search: None,
             clipboard: String::new(),
             mouse_was_down: false,
+            first_visible_line: 0,
+            horizontal_offset: 0,
+            last_caret_offset: 0,
+            scroll_drag: None,
+            save_job: None,
             fonts,
         })
     }
 
     fn set_message(&mut self, _message: impl Into<String>) {}
+
+    fn reset_scroll(&mut self, app: &BlitzApp) {
+        self.first_visible_line = 0;
+        self.horizontal_offset = 0;
+        self.last_caret_offset = app.caret_offset();
+    }
+
+    fn scroll_vertical(&mut self, app: &BlitzApp, delta_lines: isize, visible_lines: usize) {
+        let max_first_line = max_first_visible_line(app, visible_lines);
+        self.first_visible_line =
+            offset_with_delta(self.first_visible_line, delta_lines).min(max_first_line);
+        self.clamp_horizontal(app, visible_lines);
+    }
+
+    fn scroll_horizontal(&mut self, app: &BlitzApp, delta_bytes: isize, visible_lines: usize) {
+        self.horizontal_offset = offset_with_delta(self.horizontal_offset, delta_bytes);
+        self.clamp_horizontal(app, visible_lines);
+    }
+
+    fn clamp_horizontal(&mut self, app: &BlitzApp, visible_lines: usize) {
+        self.horizontal_offset = self.horizontal_offset.min(max_visible_line_len(
+            app,
+            self.first_visible_line,
+            visible_lines,
+        ));
+    }
+
+    fn follow_caret_if_moved(&mut self, app: &BlitzApp, width: usize, height: usize) -> Result<()> {
+        if self.last_caret_offset == app.caret_offset() {
+            return Ok(());
+        }
+
+        if let Some(metrics) = editor_metrics(&app.ui_state()?, width, height) {
+            let caret_line = app.document().line_for_offset(app.caret_offset())?;
+            if caret_line < self.first_visible_line {
+                self.first_visible_line = caret_line;
+            } else if caret_line >= self.first_visible_line + metrics.visible_line_count {
+                self.first_visible_line = caret_line
+                    .saturating_sub(metrics.visible_line_count)
+                    .saturating_add(1);
+            }
+            self.first_visible_line = self
+                .first_visible_line
+                .min(max_first_visible_line(app, metrics.visible_line_count));
+
+            let visible_line =
+                app.document()
+                    .visible_lines_at(caret_line, 1, self.horizontal_offset);
+            if let Some(line) = visible_line.first() {
+                if app.caret_offset() < line.byte_range.start
+                    || app.caret_offset() > line.byte_range.end
+                {
+                    let line_start = app.document().line_start(caret_line).unwrap_or(0);
+                    self.horizontal_offset = app.caret_offset().saturating_sub(line_start);
+                }
+            }
+            self.clamp_horizontal(app, metrics.visible_line_count);
+        }
+
+        self.last_caret_offset = app.caret_offset();
+        Ok(())
+    }
+}
+
+struct SaveJob {
+    receiver: Receiver<SaveJobResult>,
+}
+
+struct SaveJobResult {
+    generation: u64,
+    result: Result<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollDrag {
+    Vertical { grab_offset: usize },
+    Horizontal { grab_offset: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrameSignature {
+    width: usize,
+    height: usize,
+    ui_state: NotepadUiState,
+    document_line_count: usize,
+    active_menu: Option<usize>,
+    dialog: Option<DialogState>,
+    first_visible_line: usize,
+    horizontal_offset: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFrame {
+    signature: FrameSignature,
+    frame: RenderFrame,
+}
+
+fn frame_signature(
+    app: &BlitzApp,
+    state: &NotepadUiState,
+    width: usize,
+    height: usize,
+    gui_state: &GuiState,
+) -> FrameSignature {
+    FrameSignature {
+        width,
+        height,
+        ui_state: state.clone(),
+        document_line_count: app.document().line_count_snapshot(),
+        active_menu: gui_state.active_menu,
+        dialog: gui_state.dialog.clone(),
+        first_visible_line: gui_state.first_visible_line,
+        horizontal_offset: gui_state.horizontal_offset,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,7 +358,8 @@ fn handle_mouse(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -
     let mouse_down = window.get_mouse_down(MouseButton::Left);
     let clicked = mouse_down && !gui_state.mouse_was_down;
     gui_state.mouse_was_down = mouse_down;
-    if !clicked {
+    if !mouse_down {
+        gui_state.scroll_drag = None;
         return Ok(false);
     }
 
@@ -215,8 +367,19 @@ fn handle_mouse(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -
         return Ok(false);
     };
     let (width, height) = window.get_size();
+    let width = width.max(MIN_WIDTH);
+    let height = height.max(MIN_HEIGHT);
     let x = mouse_x as usize;
     let y = mouse_y as usize;
+
+    if gui_state.scroll_drag.is_some() {
+        update_scroll_drag(app, gui_state, width, height, x, y)?;
+        return Ok(false);
+    }
+
+    if !clicked {
+        return Ok(false);
+    }
 
     if gui_state.dialog.is_some() {
         return Ok(false);
@@ -239,10 +402,210 @@ fn handle_mouse(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -
         gui_state.active_menu = None;
     }
 
-    if let Some(offset) = text_offset_for_point(app, &gui_state.fonts, width, height, x, y) {
+    if handle_scrollbar_click(app, gui_state, width, height, x, y)? {
+        return Ok(false);
+    }
+
+    if let Some(offset) = text_offset_for_point(app, gui_state, width, height, x, y) {
         app.set_caret_offset(offset)?;
     }
     Ok(false)
+}
+
+fn handle_scrollbar_click(
+    app: &BlitzApp,
+    gui_state: &mut GuiState,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) -> Result<bool> {
+    let state = app.ui_state()?;
+    let Some(metrics) = editor_metrics(&state, width, height) else {
+        return Ok(false);
+    };
+
+    if x >= metrics.text_width && y >= metrics.text_top && y < metrics.editor_bottom {
+        let (thumb_y, thumb_height) = scroll_thumb(
+            metrics.text_top,
+            metrics.text_height,
+            app.document().line_count(),
+            metrics.visible_line_count,
+            gui_state.first_visible_line,
+        );
+        if y >= thumb_y && y < thumb_y + thumb_height {
+            gui_state.scroll_drag = Some(ScrollDrag::Vertical {
+                grab_offset: y - thumb_y,
+            });
+            return Ok(true);
+        }
+        let page = metrics.visible_line_count as isize;
+        let delta = if y < thumb_y {
+            -page
+        } else if y >= thumb_y + thumb_height {
+            page
+        } else {
+            0
+        };
+        gui_state.scroll_vertical(app, delta, metrics.visible_line_count);
+        return Ok(true);
+    }
+
+    if let Some(scroll_y) = metrics.horizontal_scroll_y {
+        if y >= scroll_y && y < scroll_y + SCROLLBAR_WIDTH && x < metrics.text_width {
+            let max_line_len = max_visible_line_len(
+                app,
+                gui_state.first_visible_line,
+                metrics.visible_line_count,
+            );
+            let visible_bytes = visible_byte_capacity(&gui_state.fonts, metrics.editor_text_width);
+            let (thumb_x, thumb_width) = scroll_thumb(
+                0,
+                metrics.text_width,
+                max_line_len.max(visible_bytes),
+                visible_bytes,
+                gui_state.horizontal_offset,
+            );
+            if x >= thumb_x && x < thumb_x + thumb_width {
+                gui_state.scroll_drag = Some(ScrollDrag::Horizontal {
+                    grab_offset: x - thumb_x,
+                });
+                return Ok(true);
+            }
+            let page = visible_bytes as isize;
+            let delta = if x < thumb_x {
+                -page
+            } else if x >= thumb_x + thumb_width {
+                page
+            } else {
+                0
+            };
+            gui_state.scroll_horizontal(app, delta, metrics.visible_line_count);
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn update_scroll_drag(
+    app: &BlitzApp,
+    gui_state: &mut GuiState,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) -> Result<()> {
+    let state = app.ui_state()?;
+    let Some(metrics) = editor_metrics(&state, width, height) else {
+        return Ok(());
+    };
+
+    match gui_state.scroll_drag {
+        Some(ScrollDrag::Vertical { grab_offset }) => {
+            let (_, thumb_height) = scroll_thumb(
+                metrics.text_top,
+                metrics.text_height,
+                app.document().line_count(),
+                metrics.visible_line_count,
+                gui_state.first_visible_line,
+            );
+            let thumb_y = y.saturating_sub(grab_offset).clamp(
+                metrics.text_top,
+                metrics.editor_bottom.saturating_sub(thumb_height),
+            );
+            gui_state.first_visible_line = offset_for_thumb(
+                metrics.text_top,
+                metrics.text_height,
+                thumb_height,
+                app.document().line_count(),
+                metrics.visible_line_count,
+                thumb_y,
+            );
+            gui_state.scroll_vertical(app, 0, metrics.visible_line_count);
+        }
+        Some(ScrollDrag::Horizontal { grab_offset }) => {
+            let max_line_len = max_visible_line_len(
+                app,
+                gui_state.first_visible_line,
+                metrics.visible_line_count,
+            );
+            let visible_bytes = visible_byte_capacity(&gui_state.fonts, metrics.editor_text_width);
+            let (_, thumb_width) = scroll_thumb(
+                0,
+                metrics.text_width,
+                max_line_len.max(visible_bytes),
+                visible_bytes,
+                gui_state.horizontal_offset,
+            );
+            let thumb_x = x
+                .saturating_sub(grab_offset)
+                .clamp(0, metrics.text_width.saturating_sub(thumb_width));
+            gui_state.horizontal_offset = offset_for_thumb(
+                0,
+                metrics.text_width,
+                thumb_width,
+                max_line_len.max(visible_bytes),
+                visible_bytes,
+                thumb_x,
+            );
+            gui_state.clamp_horizontal(app, metrics.visible_line_count);
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
+fn handle_scroll_wheel(
+    window: &Window,
+    app: &BlitzApp,
+    gui_state: &mut GuiState,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let Some((scroll_x, scroll_y)) = window.get_scroll_wheel() else {
+        return Ok(());
+    };
+    let state = app.ui_state()?;
+    let Some(metrics) = editor_metrics(&state, width, height) else {
+        return Ok(());
+    };
+
+    if !is_shift_down(window) {
+        let delta_lines = (-(scroll_y * WHEEL_LINES as f32).round()) as isize;
+        if delta_lines != 0 {
+            gui_state.scroll_vertical(app, delta_lines, metrics.visible_line_count);
+        }
+    }
+
+    if metrics.horizontal_scroll_y.is_some() {
+        let horizontal_scroll = scroll_x + if is_shift_down(window) { scroll_y } else { 0.0 };
+        let delta_bytes = (-(horizontal_scroll * HORIZONTAL_WHEEL_BYTES as f32).round()) as isize;
+        if delta_bytes != 0 {
+            gui_state.scroll_horizontal(app, delta_bytes, metrics.visible_line_count);
+        }
+    }
+
+    Ok(())
+}
+
+fn scroll_page(
+    window: &Window,
+    app: &BlitzApp,
+    gui_state: &mut GuiState,
+    direction: isize,
+) -> Result<()> {
+    let (width, height) = window.get_size();
+    let state = app.ui_state()?;
+    if let Some(metrics) = editor_metrics(&state, width.max(MIN_WIDTH), height.max(MIN_HEIGHT)) {
+        gui_state.scroll_vertical(
+            app,
+            direction * metrics.visible_line_count as isize,
+            metrics.visible_line_count,
+        );
+    }
+    Ok(())
 }
 
 fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
@@ -260,6 +623,7 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
                 open_new_window(gui_state);
             } else if confirm_unsaved_changes(app, gui_state)? {
                 app.new_document();
+                gui_state.reset_scroll(app);
                 gui_state.set_message("New document");
             }
         }
@@ -363,6 +727,8 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
             Key::Right => app.move_right()?,
             Key::Up => app.move_up()?,
             Key::Down => app.move_down()?,
+            Key::PageUp => scroll_page(window, app, gui_state, -1)?,
+            Key::PageDown => scroll_page(window, app, gui_state, 1)?,
             Key::Home => app.move_line_start()?,
             Key::End => app.move_line_end()?,
             Key::Backspace => {
@@ -585,6 +951,7 @@ fn execute_menu_row(
         ("File", "New") => {
             if confirm_unsaved_changes(app, gui_state)? {
                 app.new_document();
+                gui_state.reset_scroll(app);
                 gui_state.set_message("New document");
             }
         }
@@ -717,11 +1084,17 @@ fn open_document_dialog(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<
         return Ok(());
     };
     app.open_document(&path)?;
+    gui_state.reset_scroll(app);
     gui_state.set_message(format!("Opened {}", path.display()));
     Ok(())
 }
 
 fn confirm_unsaved_changes(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<bool> {
+    if gui_state.save_job.is_some() {
+        gui_state.set_message("Saving");
+        return Ok(false);
+    }
+
     if !app.document().is_dirty() {
         return Ok(true);
     }
@@ -740,7 +1113,7 @@ fn confirm_unsaved_changes(app: &mut BlitzApp, gui_state: &mut GuiState) -> Resu
 
     match result {
         MessageDialogResult::Yes => {
-            save_document_or_dialog(app, gui_state)?;
+            save_document_or_dialog_blocking(app, gui_state)?;
             Ok(!app.document().is_dirty())
         }
         MessageDialogResult::No => Ok(true),
@@ -749,6 +1122,15 @@ fn confirm_unsaved_changes(app: &mut BlitzApp, gui_state: &mut GuiState) -> Resu
 }
 
 fn save_document_or_dialog(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    if start_background_save(app, gui_state)? {
+        gui_state.set_message("Saving");
+    } else {
+        save_as_dialog(app, gui_state)?;
+    }
+    Ok(())
+}
+
+fn save_document_or_dialog_blocking(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
     if app.save()? {
         gui_state.set_message("Saved");
     } else {
@@ -757,7 +1139,76 @@ fn save_document_or_dialog(app: &mut BlitzApp, gui_state: &mut GuiState) -> Resu
     Ok(())
 }
 
+fn start_background_save(app: &BlitzApp, gui_state: &mut GuiState) -> Result<bool> {
+    if gui_state.save_job.is_some() {
+        gui_state.set_message("Saving");
+        return Ok(true);
+    }
+
+    let Some(snapshot) = app.save_snapshot() else {
+        return Ok(false);
+    };
+    let generation = snapshot.generation;
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("blitz-save".to_owned())
+        .spawn(move || {
+            let result = snapshot.document.save_snapshot_to_path(
+                &snapshot.path,
+                snapshot.encoding,
+                snapshot.line_ending,
+            );
+            let _ = sender.send(SaveJobResult { generation, result });
+        })?;
+    gui_state.save_job = Some(SaveJob { receiver });
+    Ok(true)
+}
+
+fn poll_save_job(app: &mut BlitzApp, gui_state: &mut GuiState) {
+    let Some(received) = gui_state
+        .save_job
+        .as_ref()
+        .map(|job| job.receiver.try_recv())
+    else {
+        return;
+    };
+
+    match received {
+        Ok(result) => {
+            gui_state.save_job = None;
+            match result.result {
+                Ok(saved_len) => {
+                    if app.complete_save_snapshot(result.generation, saved_len) {
+                        gui_state.set_message("Saved");
+                    } else {
+                        gui_state.set_message("Saved snapshot; newer edits remain");
+                    }
+                }
+                Err(error) => {
+                    gui_state.dialog = Some(DialogState::Info {
+                        title: "Save".to_owned(),
+                        message: format!("Save failed: {error}"),
+                    });
+                }
+            }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            gui_state.save_job = None;
+            gui_state.dialog = Some(DialogState::Info {
+                title: "Save".to_owned(),
+                message: "Save failed: worker stopped".to_owned(),
+            });
+        }
+    }
+}
+
 fn save_as_dialog(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    if gui_state.save_job.is_some() {
+        gui_state.set_message("Saving");
+        return Ok(());
+    }
+
     let Some(path) = FileDialog::new()
         .add_filter("Text", &["txt", "log", "md"])
         .set_file_name("Untitled.txt")
@@ -826,7 +1277,9 @@ pub struct RenderFrame {
 
 pub fn render_frame(app: &BlitzApp, width: usize, height: usize) -> Result<RenderFrame> {
     let gui_state = GuiState::new()?;
-    render_frame_with_state(app, width, height, &gui_state)
+    app.document().refresh_line_index();
+    let state = app.ui_state()?;
+    render_frame_with_state(app, &state, width, height, &gui_state)
 }
 
 pub fn save_startup_screenshot(app: &BlitzApp, path: impl AsRef<Path>) -> Result<()> {
@@ -860,14 +1313,14 @@ pub fn write_png(frame: &RenderFrame, path: impl AsRef<Path>) -> Result<()> {
 
 fn render_frame_with_state(
     app: &BlitzApp,
+    state: &NotepadUiState,
     width: usize,
     height: usize,
     gui_state: &GuiState,
 ) -> Result<RenderFrame> {
-    let state = app.ui_state()?;
     let mut canvas = Canvas::new(width.max(1), height.max(1), COLOR_WINDOW);
-    draw_chrome(&mut canvas, &state, gui_state);
-    draw_text_area(&mut canvas, app, &state, &gui_state.fonts);
+    draw_chrome(&mut canvas, state, gui_state);
+    draw_text_area(&mut canvas, app, state, gui_state);
     if let Some(menu_index) = gui_state.active_menu {
         draw_menu_popup(&mut canvas, app, menu_index, &gui_state.fonts);
     }
@@ -1179,77 +1632,278 @@ fn on_off(value: bool) -> &'static str {
     }
 }
 
-fn draw_text_area(canvas: &mut Canvas, app: &BlitzApp, state: &NotepadUiState, fonts: &FontStack) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EditorMetrics {
+    text_top: usize,
+    text_bottom: usize,
+    editor_bottom: usize,
+    text_width: usize,
+    text_height: usize,
+    editor_text_width: usize,
+    visible_line_count: usize,
+    horizontal_scroll_y: Option<usize>,
+}
+
+fn editor_metrics(state: &NotepadUiState, width: usize, height: usize) -> Option<EditorMetrics> {
     let status_height = if state.status_bar_visible {
         STATUS_HEIGHT
     } else {
         0
     };
     let text_top = text_top();
-    let text_bottom = canvas.height.saturating_sub(status_height + 1);
+    let text_bottom = height.saturating_sub(status_height + 1);
     if text_bottom <= text_top {
-        return;
+        return None;
     }
 
-    let text_height = text_bottom - text_top;
-    let text_width = canvas.width.saturating_sub(SCROLLBAR_WIDTH);
-    canvas.fill_rect(0, text_top, text_width, text_height, COLOR_TEXT_AREA);
-    canvas.fill_rect(
-        text_width,
+    let text_width = width.saturating_sub(SCROLLBAR_WIDTH);
+    let horizontal_scroll_y = (!state.word_wrap && text_bottom > text_top + SCROLLBAR_WIDTH)
+        .then(|| text_bottom.saturating_sub(SCROLLBAR_WIDTH));
+    let editor_bottom = horizontal_scroll_y.unwrap_or(text_bottom);
+    if editor_bottom <= text_top {
+        return None;
+    }
+
+    let text_height = editor_bottom - text_top;
+    Some(EditorMetrics {
         text_top,
-        SCROLLBAR_WIDTH,
+        text_bottom,
+        editor_bottom,
+        text_width,
         text_height,
-        COLOR_SCROLLBAR,
+        editor_text_width: text_width.saturating_sub(TEXT_MARGIN_X + 4),
+        visible_line_count: text_height
+            .saturating_sub(TEXT_MARGIN_Y * 2)
+            .checked_div(EDITOR_LINE_HEIGHT)
+            .unwrap_or(0)
+            .max(1),
+        horizontal_scroll_y,
+    })
+}
+
+fn max_first_visible_line(app: &BlitzApp, visible_lines: usize) -> usize {
+    app.document()
+        .line_count()
+        .saturating_sub(visible_lines.max(1))
+}
+
+fn max_visible_line_len(app: &BlitzApp, first_line: usize, visible_lines: usize) -> usize {
+    (first_line..first_line.saturating_add(visible_lines))
+        .filter_map(|line| app.document().line_range(line))
+        .map(|range| range.len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn visible_byte_capacity(fonts: &FontStack, editor_text_width: usize) -> usize {
+    let average_char_width = fonts.measure("m", TextRole::Editor).max(1);
+    editor_text_width.saturating_div(average_char_width).max(1)
+}
+
+fn offset_with_delta(offset: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        offset.saturating_add(delta as usize)
+    } else {
+        offset.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn scroll_thumb(
+    track_start: usize,
+    track_len: usize,
+    content_len: usize,
+    visible_len: usize,
+    offset: usize,
+) -> (usize, usize) {
+    if track_len == 0 || content_len <= visible_len || visible_len == 0 {
+        return (track_start, track_len.max(1));
+    }
+
+    let thumb_len = ((track_len as u128 * visible_len as u128) / content_len as u128)
+        .try_into()
+        .unwrap_or(track_len)
+        .clamp(MIN_SCROLL_THUMB.min(track_len), track_len);
+    let max_offset = content_len.saturating_sub(visible_len).max(1);
+    let travel = track_len.saturating_sub(thumb_len);
+    let thumb_offset = ((travel as u128 * offset.min(max_offset) as u128) / max_offset as u128)
+        .try_into()
+        .unwrap_or(travel);
+    (track_start + thumb_offset, thumb_len)
+}
+
+fn offset_for_thumb(
+    track_start: usize,
+    track_len: usize,
+    thumb_len: usize,
+    content_len: usize,
+    visible_len: usize,
+    thumb_position: usize,
+) -> usize {
+    if track_len <= thumb_len || content_len <= visible_len || visible_len == 0 {
+        return 0;
+    }
+
+    let travel = track_len - thumb_len;
+    let max_offset = content_len - visible_len;
+    let thumb_offset = thumb_position.saturating_sub(track_start).min(travel);
+    ((thumb_offset as u128 * max_offset as u128) / travel as u128)
+        .try_into()
+        .unwrap_or(max_offset)
+}
+
+fn draw_vertical_scrollbar(
+    canvas: &mut Canvas,
+    app: &BlitzApp,
+    gui_state: &GuiState,
+    metrics: EditorMetrics,
+) {
+    let (thumb_y, thumb_height) = scroll_thumb(
+        metrics.text_top,
+        metrics.text_height,
+        app.document().line_count(),
+        metrics.visible_line_count,
+        gui_state.first_visible_line,
     );
-    canvas.line(text_width, text_top, text_width, text_bottom, COLOR_BORDER);
     canvas.fill_rect(
-        text_width + 4,
-        text_top + 16,
+        metrics.text_width + 4,
+        thumb_y,
         SCROLLBAR_WIDTH.saturating_sub(8),
-        72.min(text_height.saturating_sub(32)),
+        thumb_height,
         COLOR_SCROLL_THUMB,
     );
+}
 
-    if !state.word_wrap && text_bottom > SCROLLBAR_WIDTH {
-        let scroll_y = text_bottom.saturating_sub(SCROLLBAR_WIDTH);
-        canvas.fill_rect(0, scroll_y, text_width, SCROLLBAR_WIDTH, COLOR_SCROLLBAR);
-        canvas.line(0, scroll_y, text_width, scroll_y, COLOR_BORDER);
+fn draw_horizontal_scrollbar(
+    canvas: &mut Canvas,
+    app: &BlitzApp,
+    gui_state: &GuiState,
+    metrics: EditorMetrics,
+    scroll_y: usize,
+) {
+    let max_line_len = max_visible_line_len(
+        app,
+        gui_state.first_visible_line,
+        metrics.visible_line_count,
+    );
+    let visible_bytes = visible_byte_capacity(&gui_state.fonts, metrics.editor_text_width);
+    let (thumb_x, thumb_width) = scroll_thumb(
+        0,
+        metrics.text_width,
+        max_line_len.max(visible_bytes),
+        visible_bytes,
+        gui_state.horizontal_offset,
+    );
+    canvas.fill_rect(
+        thumb_x,
+        scroll_y + 4,
+        thumb_width,
+        SCROLLBAR_WIDTH.saturating_sub(8),
+        COLOR_SCROLL_THUMB,
+    );
+}
+
+fn draw_text_area(
+    canvas: &mut Canvas,
+    app: &BlitzApp,
+    state: &NotepadUiState,
+    gui_state: &GuiState,
+) {
+    let Some(metrics) = editor_metrics(state, canvas.width, canvas.height) else {
+        return;
+    };
+    let fonts = &gui_state.fonts;
+
+    canvas.fill_rect(
+        0,
+        metrics.text_top,
+        metrics.text_width,
+        metrics.text_height,
+        COLOR_TEXT_AREA,
+    );
+    canvas.fill_rect(
+        metrics.text_width,
+        metrics.text_top,
+        SCROLLBAR_WIDTH,
+        metrics.text_height,
+        COLOR_SCROLLBAR,
+    );
+    canvas.line(
+        metrics.text_width,
+        metrics.text_top,
+        metrics.text_width,
+        metrics.text_bottom,
+        COLOR_BORDER,
+    );
+    draw_vertical_scrollbar(canvas, app, gui_state, metrics);
+
+    if let Some(scroll_y) = metrics.horizontal_scroll_y {
         canvas.fill_rect(
-            24,
-            scroll_y + 4,
-            90.min(text_width.saturating_sub(48)),
-            8,
-            COLOR_SCROLL_THUMB,
+            0,
+            scroll_y,
+            metrics.text_width,
+            SCROLLBAR_WIDTH,
+            COLOR_SCROLLBAR,
         );
+        canvas.line(0, scroll_y, metrics.text_width, scroll_y, COLOR_BORDER);
+        draw_horizontal_scrollbar(canvas, app, gui_state, metrics, scroll_y);
     }
 
-    let max_lines = text_height.saturating_sub(TEXT_MARGIN_Y * 2) / EDITOR_LINE_HEIGHT;
-    let visible_lines = app.document().visible_lines(0, max_lines.max(1));
+    let first_visible_line = gui_state
+        .first_visible_line
+        .min(max_first_visible_line(app, metrics.visible_line_count));
+    let visible_lines = app.document().visible_lines_at(
+        first_visible_line,
+        metrics.visible_line_count,
+        gui_state.horizontal_offset,
+    );
     for (index, line) in visible_lines.iter().enumerate() {
-        let y = text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
-        canvas.text(
-            TEXT_MARGIN_X,
-            y,
-            &line.text,
-            COLOR_TEXT,
-            TextRole::Editor,
+        let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
+        let text = text_prefix_for_width(
             fonts,
+            &line.text,
+            TextRole::Editor,
+            metrics.editor_text_width,
         );
+        canvas.text(TEXT_MARGIN_X, y, text, COLOR_TEXT, TextRole::Editor, fonts);
     }
 
     if visible_lines.is_empty() {
-        draw_caret(canvas, TEXT_MARGIN_X, text_top + TEXT_MARGIN_Y);
-    } else if state.caret_line <= visible_lines.len() {
-        let line = &visible_lines[state.caret_line - 1];
+        draw_caret(canvas, TEXT_MARGIN_X, metrics.text_top + TEXT_MARGIN_Y);
+    } else if let Some(visible_index) = state
+        .caret_line
+        .checked_sub(1)
+        .and_then(|line| line.checked_sub(first_visible_line))
+        .filter(|index| *index < visible_lines.len())
+    {
+        let line = &visible_lines[visible_index];
         let local_offset = app
             .caret_offset()
             .saturating_sub(line.byte_range.start)
             .min(line.text.len());
         let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
-        let caret_x = TEXT_MARGIN_X + fonts.measure(prefix, TextRole::Editor);
-        let y = text_top + TEXT_MARGIN_Y + (state.caret_line - 1) * EDITOR_LINE_HEIGHT;
+        let visible_prefix =
+            text_prefix_for_width(fonts, prefix, TextRole::Editor, metrics.editor_text_width);
+        let caret_x = TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor);
+        let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
         draw_caret(canvas, caret_x, y);
     }
+}
+
+fn text_prefix_for_width<'a>(
+    fonts: &FontStack,
+    text: &'a str,
+    role: TextRole,
+    max_width: usize,
+) -> &'a str {
+    let limit = max_width as f32;
+    let mut width = 0.0f32;
+    for (index, character) in text.char_indices() {
+        width += fonts.measure_char(character, role);
+        if width > limit {
+            return &text[..index];
+        }
+    }
+    text
 }
 
 fn draw_caret(canvas: &mut Canvas, x: usize, y: usize) {
@@ -1258,31 +1912,28 @@ fn draw_caret(canvas: &mut Canvas, x: usize, y: usize) {
 
 fn text_offset_for_point(
     app: &BlitzApp,
-    fonts: &FontStack,
+    gui_state: &GuiState,
     width: usize,
     height: usize,
     x: usize,
     y: usize,
 ) -> Option<usize> {
     let state = app.ui_state().ok()?;
-    let status_height = if state.status_bar_visible {
-        STATUS_HEIGHT
-    } else {
-        0
-    };
-    let text_top = text_top();
-    let text_bottom = height.saturating_sub(status_height + 1);
-    let text_width = width.saturating_sub(SCROLLBAR_WIDTH);
-    if y < text_top + TEXT_MARGIN_Y || y >= text_bottom || x >= text_width {
+    let metrics = editor_metrics(&state, width, height)?;
+    if y < metrics.text_top + TEXT_MARGIN_Y || y >= metrics.editor_bottom || x >= metrics.text_width
+    {
         return None;
     }
 
-    let line_index = (y - text_top - TEXT_MARGIN_Y) / EDITOR_LINE_HEIGHT;
-    let max_lines = text_bottom
-        .saturating_sub(text_top)
-        .saturating_sub(TEXT_MARGIN_Y * 2)
-        / EDITOR_LINE_HEIGHT;
-    let visible_lines = app.document().visible_lines(0, max_lines.max(1));
+    let line_index = (y - metrics.text_top - TEXT_MARGIN_Y) / EDITOR_LINE_HEIGHT;
+    let first_visible_line = gui_state
+        .first_visible_line
+        .min(max_first_visible_line(app, metrics.visible_line_count));
+    let visible_lines = app.document().visible_lines_at(
+        first_visible_line,
+        metrics.visible_line_count,
+        gui_state.horizontal_offset,
+    );
     if visible_lines.is_empty() {
         return Some(0);
     }
@@ -1292,7 +1943,7 @@ fn text_offset_for_point(
         .or_else(|| visible_lines.last())?;
     let target_x = x.saturating_sub(TEXT_MARGIN_X) as f32;
     Some(offset_for_x(
-        fonts,
+        &gui_state.fonts,
         &line.text,
         line.byte_range.start,
         target_x,
@@ -1469,7 +2120,7 @@ fn text_top() -> usize {
     MENU_HEIGHT + 1
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TextRole {
     Ui,
     Editor,
@@ -1483,6 +2134,20 @@ struct LoadedFont {
 
 struct FontStack {
     fonts: Vec<LoadedFont>,
+    glyph_cache: RefCell<HashMap<GlyphCacheKey, GlyphMetrics>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GlyphCacheKey {
+    character: char,
+    role: TextRole,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlyphMetrics {
+    font_index: usize,
+    glyph_id: GlyphId,
+    advance: f32,
 }
 
 impl FontStack {
@@ -1520,7 +2185,10 @@ impl FontStack {
             return Err(BlitzError::Window("no usable system font found".to_owned()));
         }
 
-        Ok(Self { fonts })
+        Ok(Self {
+            fonts,
+            glyph_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     fn description(&self) -> String {
@@ -1553,12 +2221,7 @@ impl FontStack {
         if character == '\t' {
             return self.measure_char(' ', role) * 4.0;
         }
-        let size = self.size(role);
-        let font = self.font_for(character);
-        let glyph_id = font.glyph_id(character);
-        font.as_scaled(PxScale::from(size))
-            .h_advance(glyph_id)
-            .max(size * 0.35)
+        self.glyph_metrics(character, role).advance
     }
 
     fn draw_text(
@@ -1577,9 +2240,11 @@ impl FontStack {
                 cursor += self.measure_char(character, role);
                 continue;
             }
-            let font = self.font_for(character);
-            let glyph_id = font.glyph_id(character);
-            let glyph = glyph_id.with_scale_and_position(size, point(cursor, baseline));
+            let metrics = self.glyph_metrics(character, role);
+            let font = &self.fonts[metrics.font_index].font;
+            let glyph = metrics
+                .glyph_id
+                .with_scale_and_position(size, point(cursor, baseline));
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|glyph_x, glyph_y, coverage| {
@@ -1591,19 +2256,41 @@ impl FontStack {
                     );
                 });
             }
-            cursor += font
-                .as_scaled(PxScale::from(size))
-                .h_advance(glyph_id)
-                .max(size * 0.35);
+            cursor += metrics.advance;
         }
     }
 
-    fn font_for(&self, character: char) -> &FontArc {
+    fn glyph_metrics(&self, character: char, role: TextRole) -> GlyphMetrics {
+        let key = GlyphCacheKey { character, role };
+        if let Some(metrics) = self.glyph_cache.borrow().get(&key) {
+            return *metrics;
+        }
+
+        let (font_index, glyph_id) = self.font_index_for(character);
+        let size = self.size(role);
+        let advance = self.fonts[font_index]
+            .font
+            .as_scaled(PxScale::from(size))
+            .h_advance(glyph_id)
+            .max(size * 0.35);
+        let metrics = GlyphMetrics {
+            font_index,
+            glyph_id,
+            advance,
+        };
+        self.glyph_cache.borrow_mut().insert(key, metrics);
+        metrics
+    }
+
+    fn font_index_for(&self, character: char) -> (usize, GlyphId) {
         self.fonts
             .iter()
-            .find(|loaded| loaded.font.glyph_id(character) != GlyphId(0))
-            .map(|loaded| &loaded.font)
-            .unwrap_or(&self.fonts[0].font)
+            .enumerate()
+            .find_map(|(index, loaded)| {
+                let glyph_id = loaded.font.glyph_id(character);
+                (glyph_id != GlyphId(0)).then_some((index, glyph_id))
+            })
+            .unwrap_or_else(|| (0, self.fonts[0].font.glyph_id(character)))
     }
 }
 
@@ -1746,26 +2433,134 @@ mod tests {
 
     #[test]
     fn mouse_point_maps_to_document_offset() {
-        let fonts = FontStack::load().expect("fonts");
+        let mut gui_state = GuiState::new().expect("gui state");
         let mut app = BlitzApp::new(EditorSettings::default());
-        app.insert_text("abc\ndef").expect("insert");
+        app.insert_text(&"abc\ndef\n".repeat(32)).expect("insert");
 
-        let x_for_c = TEXT_MARGIN_X + fonts.measure_text("ab", TextRole::Editor) as usize;
-        let offset =
-            text_offset_for_point(&app, &fonts, 640, 400, x_for_c, text_top() + TEXT_MARGIN_Y)
-                .expect("offset");
+        let x_for_c = TEXT_MARGIN_X + gui_state.fonts.measure_text("ab", TextRole::Editor) as usize;
+        let offset = text_offset_for_point(
+            &app,
+            &gui_state,
+            640,
+            400,
+            x_for_c,
+            text_top() + TEXT_MARGIN_Y,
+        )
+        .expect("offset");
         assert_eq!(offset, 2);
 
         let second_line = text_offset_for_point(
             &app,
-            &fonts,
+            &gui_state,
             640,
             400,
-            TEXT_MARGIN_X + fonts.measure_text("d", TextRole::Editor) as usize,
+            TEXT_MARGIN_X + gui_state.fonts.measure_text("d", TextRole::Editor) as usize,
             text_top() + TEXT_MARGIN_Y + EDITOR_LINE_HEIGHT,
         )
         .expect("offset");
         assert_eq!(second_line, "abc\n".len() + 1);
+
+        gui_state.first_visible_line = 1;
+        let scrolled_top_line = text_offset_for_point(
+            &app,
+            &gui_state,
+            640,
+            400,
+            TEXT_MARGIN_X,
+            text_top() + TEXT_MARGIN_Y,
+        )
+        .expect("scrolled offset");
+        assert_eq!(scrolled_top_line, "abc\n".len());
+    }
+
+    #[test]
+    fn horizontal_scroll_offsets_hit_testing() {
+        let mut gui_state = GuiState::new().expect("gui state");
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("abcdef").expect("insert");
+        gui_state.horizontal_offset = 3;
+
+        let offset = text_offset_for_point(
+            &app,
+            &gui_state,
+            640,
+            400,
+            TEXT_MARGIN_X,
+            text_top() + TEXT_MARGIN_Y,
+        )
+        .expect("offset");
+
+        assert_eq!(offset, 3);
+    }
+
+    #[test]
+    fn scrollbar_clicks_move_viewport() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        app.insert_text(
+            &(0..100)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>(),
+        )
+        .expect("insert");
+
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 640, 400).expect("metrics");
+        let clicked = handle_scrollbar_click(
+            &app,
+            &mut gui_state,
+            640,
+            400,
+            metrics.text_width + 2,
+            metrics.editor_bottom - 2,
+        )
+        .expect("click");
+
+        assert!(clicked);
+        assert!(gui_state.first_visible_line > 0);
+    }
+
+    #[test]
+    fn horizontal_scrollbar_click_and_drag_move_offset() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        app.insert_text(&"abcdef".repeat(400)).expect("insert");
+
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 640, 400).expect("metrics");
+        let scroll_y = metrics.horizontal_scroll_y.expect("horizontal scrollbar");
+
+        let clicked = handle_scrollbar_click(
+            &app,
+            &mut gui_state,
+            640,
+            400,
+            metrics.text_width - 2,
+            scroll_y + 8,
+        )
+        .expect("track click");
+        assert!(clicked);
+        assert!(gui_state.horizontal_offset > 0);
+
+        gui_state.horizontal_offset = 0;
+        handle_scrollbar_click(&app, &mut gui_state, 640, 400, 1, scroll_y + 8)
+            .expect("thumb click");
+        assert!(matches!(
+            gui_state.scroll_drag,
+            Some(ScrollDrag::Horizontal { .. })
+        ));
+
+        update_scroll_drag(
+            &app,
+            &mut gui_state,
+            640,
+            400,
+            metrics.text_width - 2,
+            scroll_y + 8,
+        )
+        .expect("drag");
+
+        assert!(gui_state.horizontal_offset > 0);
     }
 
     #[test]
@@ -1783,6 +2578,35 @@ mod tests {
     fn font_stack_loads_a_system_ui_font() {
         let fonts = FontStack::load().expect("fonts");
         assert!(!fonts.description().is_empty());
+    }
+
+    #[test]
+    fn font_stack_reuses_glyph_metrics() {
+        let fonts = FontStack::load().expect("fonts");
+
+        assert_eq!(fonts.glyph_cache.borrow().len(), 0);
+        let first_width = fonts.measure("ababa", TextRole::Editor);
+        let cache_len = fonts.glyph_cache.borrow().len();
+        let second_width = fonts.measure("ababa", TextRole::Editor);
+
+        assert_eq!(first_width, second_width);
+        assert_eq!(fonts.glyph_cache.borrow().len(), cache_len);
+        assert!(cache_len <= 2);
+    }
+
+    #[test]
+    fn frame_signature_tracks_viewport_changes() {
+        let app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+
+        let initial = frame_signature(&app, &state, 640, 400, &gui_state);
+        let unchanged = frame_signature(&app, &state, 640, 400, &gui_state);
+        gui_state.first_visible_line = 1;
+        let scrolled = frame_signature(&app, &state, 640, 400, &gui_state);
+
+        assert_eq!(initial, unchanged);
+        assert_ne!(initial, scrolled);
     }
 
     #[test]
@@ -1820,6 +2644,19 @@ mod tests {
             COLOR_STATUS
         );
         assert!(frame.pixels.iter().any(|pixel| *pixel == COLOR_CARET));
+    }
+
+    #[test]
+    fn long_editor_text_prefix_is_clipped_to_available_width() {
+        let fonts = FontStack::load().expect("fonts");
+        let text = "日本語abcdef".repeat(128);
+        let max_width = fonts.measure("日本語abc", TextRole::Editor);
+
+        let prefix = text_prefix_for_width(&fonts, &text, TextRole::Editor, max_width);
+
+        assert!(prefix.len() < text.len());
+        assert!(fonts.measure(prefix, TextRole::Editor) <= max_width);
+        assert!(text.is_char_boundary(prefix.len()));
     }
 
     #[test]
@@ -1886,8 +2723,10 @@ mod tests {
         let mut gui_state = GuiState::new().expect("gui state");
         gui_state.set_message("New document");
 
-        let frame = render_frame_with_state(&app, DEFAULT_WIDTH, DEFAULT_HEIGHT, &gui_state)
-            .expect("render");
+        let state = app.ui_state().expect("ui state");
+        let frame =
+            render_frame_with_state(&app, &state, DEFAULT_WIDTH, DEFAULT_HEIGHT, &gui_state)
+                .expect("render");
 
         assert_eq!(
             frame.pixels[pixel_index(&frame, TEXT_MARGIN_X + 24, text_top() + TEXT_MARGIN_Y + 4)],

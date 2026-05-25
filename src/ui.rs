@@ -137,7 +137,7 @@ impl FontDialogModel {
 pub fn default_ui_state(settings: &EditorSettings) -> NotepadUiState {
     NotepadUiState {
         file_name: "Untitled".to_owned(),
-        dirty: true,
+        dirty: false,
         caret_line: 1,
         caret_column: 1,
         zoom_percent: settings.zoom_percent,

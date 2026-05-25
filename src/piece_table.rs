@@ -69,6 +69,7 @@ pub struct PieceTable {
     original: SourceBytes,
     add: Vec<u8>,
     pieces: Vec<Piece>,
+    len: usize,
 }
 
 impl PieceTable {
@@ -108,11 +109,12 @@ impl PieceTable {
             original,
             add: Vec::new(),
             pieces,
+            len,
         })
     }
 
     pub fn len(&self) -> usize {
-        self.pieces.iter().map(|piece| piece.len).sum()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -129,6 +131,16 @@ impl PieceTable {
             bytes.extend_from_slice(self.piece_bytes(piece));
         }
         bytes
+    }
+
+    pub fn for_each_chunk<E>(
+        &self,
+        mut visit: impl FnMut(&[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for piece in &self.pieces {
+            visit(self.piece_bytes(piece))?;
+        }
+        Ok(())
     }
 
     pub fn bytes_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
@@ -153,6 +165,26 @@ impl PieceTable {
         }
 
         Ok(bytes)
+    }
+
+    pub fn byte_at(&self, offset: usize) -> Result<Option<u8>> {
+        let len = self.len();
+        if offset > len {
+            return Err(BlitzError::InvalidRange {
+                start: offset,
+                end: offset,
+                len,
+            });
+        }
+        if offset == len {
+            return Ok(None);
+        }
+
+        let (piece_index, inner_offset) = self.piece_position(offset)?;
+        Ok(self
+            .pieces
+            .get(piece_index)
+            .map(|piece| self.piece_bytes(piece)[inner_offset]))
     }
 
     pub fn to_text_lossy(&self) -> String {
@@ -197,6 +229,7 @@ impl PieceTable {
             self.pieces.splice(piece_index..=piece_index, replacement);
         }
         self.merge_adjacent();
+        self.len += text.len();
         Ok(())
     }
 
@@ -238,6 +271,7 @@ impl PieceTable {
 
         self.pieces = new_pieces;
         self.merge_adjacent();
+        self.len -= range.len();
         Ok(())
     }
 
@@ -308,11 +342,14 @@ impl PieceTable {
                 len,
             });
         }
-        let bytes = self.collect_bytes();
-        let text = std::str::from_utf8(&bytes).map_err(|error| {
-            BlitzError::Encoding(format!("document is not valid UTF-8: {error}"))
-        })?;
-        if text.is_char_boundary(byte_offset) {
+        if byte_offset == len {
+            return Ok(());
+        }
+
+        if self
+            .byte_at(byte_offset)?
+            .is_some_and(|byte| !is_utf8_continuation(byte))
+        {
             Ok(())
         } else {
             Err(BlitzError::InvalidCharBoundary {
@@ -334,6 +371,10 @@ impl PieceTable {
         }
         self.pieces = merged;
     }
+}
+
+fn is_utf8_continuation(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
 }
 
 impl Default for PieceTable {
@@ -362,5 +403,17 @@ mod tests {
             table.insert_str(1, "x"),
             Err(BlitzError::InvalidCharBoundary { offset: 1 })
         ));
+    }
+
+    #[test]
+    fn len_tracks_piece_table_edits() {
+        let mut table = PieceTable::from_text("abc");
+
+        table.insert_str(1, "日本").expect("insert");
+        assert_eq!(table.len(), "a日本bc".len());
+
+        table.delete_range(1.."a日本".len()).expect("delete");
+        assert_eq!(table.len(), "abc".len());
+        assert_eq!(table.to_text_lossy(), "abc");
     }
 }
