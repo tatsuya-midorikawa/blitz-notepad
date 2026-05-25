@@ -6,21 +6,32 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    mpsc::{self, Receiver, TryRecvError},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
 
-use ab_glyph::{point, Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont};
+use ab_glyph::{point, Font, FontArc, FontVec, GlyphId as AbGlyphId, PxScale, ScaleFont};
 use arboard::Clipboard;
 use fontdb::{Database, Family, Query};
 use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use swash::{
+    scale::{image::Content, Render, ScaleContext, Source, StrikeWith},
+    shape::{Direction, ShapeContext},
+    text::Script,
+    FontRef, GlyphId as SwashGlyphId,
+};
 
 use crate::ui::{MenuItem, NotepadUiState, MENU_BAR};
 use crate::{BlitzApp, BlitzError, Result};
 
 const DEFAULT_WIDTH: usize = 960;
 const DEFAULT_HEIGHT: usize = 640;
+const FIND_WINDOW_WIDTH: usize = 430;
+const FIND_WINDOW_HEIGHT: usize = 150;
 const MIN_WIDTH: usize = 420;
 const MIN_HEIGHT: usize = 240;
 const MENU_HEIGHT: usize = 30;
@@ -33,7 +44,9 @@ const TEXT_MARGIN_Y: usize = 8;
 const EDITOR_LINE_HEIGHT: usize = 24;
 const CARET_HEIGHT: usize = 22;
 const UI_FONT_SIZE: f32 = 15.0;
+const FIND_FONT_SIZE: f32 = 13.0;
 const EDITOR_FONT_SIZE: f32 = 18.0;
+const EMOJI_FONT_SCALE: f32 = 0.68;
 const WHEEL_LINES: isize = 3;
 const HORIZONTAL_WHEEL_BYTES: isize = 96;
 const MIN_SCROLL_THUMB: usize = 32;
@@ -44,13 +57,21 @@ const COLOR_STATUS: u32 = 0x00f0f0f0;
 const COLOR_BORDER: u32 = 0x00d4d4d4;
 const COLOR_MENU_OPEN: u32 = 0x00dbeeff;
 const COLOR_DROPDOWN: u32 = 0x00f8f8f8;
+const COLOR_BUTTON: u32 = 0x00e1e1e1;
+const COLOR_GROUP_BOX: u32 = 0x00dddddd;
 const COLOR_SCROLLBAR: u32 = 0x00e6e6e6;
 const COLOR_SCROLL_THUMB: u32 = 0x00b8b8b8;
+const COLOR_SELECTION: u32 = 0x00cce8ff;
 const COLOR_TEXT: u32 = 0x00000000;
 const COLOR_DISABLED_TEXT: u32 = 0x00808080;
 const COLOR_CARET: u32 = 0x00000000;
 
 const FONT_FAMILIES: &[&str] = &[
+    "Segoe UI",
+    "Segoe UI Emoji",
+    "Segoe UI Symbol",
+    "Segoe Fluent Icons",
+    "Segoe UI Historic",
     "Aptos",
     "Aptos Display",
     "Aptos Text",
@@ -60,7 +81,11 @@ const FONT_FAMILIES: &[&str] = &[
     "Hiragino Sans",
     "Hiragino Kaku Gothic ProN",
     "Apple SD Gothic Neo",
-    "Segoe UI",
+    "Apple Color Emoji",
+    "Noto Color Emoji",
+    "Noto Emoji",
+    "Twemoji Mozilla",
+    "Symbola",
     "Helvetica Neue",
     "Arial Unicode MS",
     "Arial",
@@ -110,6 +135,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
         }
         handle_keys(&window, &mut app, &mut gui_state)?;
         handle_text_input(&input_queue, &window, &mut app, &mut gui_state)?;
+        handle_find_window(&mut app, &mut gui_state)?;
         poll_save_job(&mut app, &mut gui_state);
 
         let (width, height) = window.get_size();
@@ -156,6 +182,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
 struct GuiState {
     active_menu: Option<usize>,
     dialog: Option<DialogState>,
+    find_window: Option<FindWindowState>,
     last_search: Option<SearchSpec>,
     clipboard: String,
     mouse_was_down: bool,
@@ -163,6 +190,9 @@ struct GuiState {
     horizontal_offset: usize,
     last_caret_offset: usize,
     scroll_drag: Option<ScrollDrag>,
+    selection_anchor: Option<usize>,
+    selection_focus: Option<usize>,
+    mouse_selecting: bool,
     save_job: Option<SaveJob>,
     fonts: FontStack,
 }
@@ -173,6 +203,7 @@ impl GuiState {
         Ok(Self {
             active_menu: None,
             dialog: None,
+            find_window: None,
             last_search: None,
             clipboard: String::new(),
             mouse_was_down: false,
@@ -180,6 +211,9 @@ impl GuiState {
             horizontal_offset: 0,
             last_caret_offset: 0,
             scroll_drag: None,
+            selection_anchor: None,
+            selection_focus: None,
+            mouse_selecting: false,
             save_job: None,
             fonts,
         })
@@ -191,6 +225,9 @@ impl GuiState {
         self.first_visible_line = 0;
         self.horizontal_offset = 0;
         self.last_caret_offset = app.caret_offset();
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        self.mouse_selecting = false;
     }
 
     fn scroll_vertical(&mut self, app: &BlitzApp, delta_lines: isize, visible_lines: usize) {
@@ -218,7 +255,7 @@ impl GuiState {
             return Ok(());
         }
 
-        if let Some(metrics) = editor_metrics(&app.ui_state()?, width, height) {
+        if let Some(metrics) = editor_metrics_for_app(app, width, height) {
             let caret_line = app.document().line_for_offset(app.caret_offset())?;
             if caret_line < self.first_visible_line {
                 self.first_visible_line = caret_line;
@@ -259,11 +296,97 @@ struct SaveJobResult {
     result: Result<u64>,
 }
 
+struct FindWindowState {
+    window: Window,
+    input_queue: Rc<RefCell<Vec<char>>>,
+    query: String,
+    match_case: bool,
+    wrap_around: bool,
+    forward: bool,
+    mouse_was_down: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FindWindowView {
+    query: String,
+    match_case: bool,
+    wrap_around: bool,
+    forward: bool,
+}
+
+impl FindWindowState {
+    fn view(&self) -> FindWindowView {
+        FindWindowView {
+            query: self.query.clone(),
+            match_case: self.match_case,
+            wrap_around: self.wrap_around,
+            forward: self.forward,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScrollDrag {
     Vertical { grab_offset: usize },
     Horizontal { grab_offset: usize },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Rect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+const FIND_FIELD_RECT: Rect = Rect {
+    x: 118,
+    y: 34,
+    width: 205,
+    height: 24,
+};
+const FIND_NEXT_BUTTON_RECT: Rect = Rect {
+    x: 333,
+    y: 30,
+    width: 82,
+    height: 26,
+};
+const FIND_CANCEL_BUTTON_RECT: Rect = Rect {
+    x: 333,
+    y: 64,
+    width: 82,
+    height: 26,
+};
+const FIND_MATCH_CASE_RECT: Rect = Rect {
+    x: 16,
+    y: 92,
+    width: 130,
+    height: 22,
+};
+const FIND_WRAP_RECT: Rect = Rect {
+    x: 16,
+    y: 120,
+    width: 140,
+    height: 22,
+};
+const FIND_UP_RADIO_RECT: Rect = Rect {
+    x: 248,
+    y: 104,
+    width: 46,
+    height: 20,
+};
+const FIND_DOWN_RADIO_RECT: Rect = Rect {
+    x: 272,
+    y: 104,
+    width: 58,
+    height: 20,
+};
+const FIND_DIRECTION_GROUP_RECT: Rect = Rect {
+    x: 220,
+    y: 82,
+    width: 110,
+    height: 50,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FrameSignature {
@@ -275,6 +398,7 @@ struct FrameSignature {
     dialog: Option<DialogState>,
     first_visible_line: usize,
     horizontal_offset: usize,
+    selected_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +423,7 @@ fn frame_signature(
         dialog: gui_state.dialog.clone(),
         first_visible_line: gui_state.first_visible_line,
         horizontal_offset: gui_state.horizontal_offset,
+        selected_range: app.selected_range(),
     }
 }
 
@@ -306,15 +431,11 @@ fn frame_signature(
 struct SearchSpec {
     query: String,
     match_case: bool,
+    wrap_around: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DialogState {
-    Find {
-        query: String,
-        match_case: bool,
-        forward: bool,
-    },
     Replace {
         query: String,
         replacement: String,
@@ -338,19 +459,52 @@ enum ReplaceField {
 
 struct TextInput {
     queue: Rc<RefCell<Vec<char>>>,
+    pending_high_surrogate: Option<u16>,
 }
 
 impl TextInput {
     fn new(queue: Rc<RefCell<Vec<char>>>) -> Self {
-        Self { queue }
+        Self {
+            queue,
+            pending_high_surrogate: None,
+        }
     }
 }
 
 impl InputCallback for TextInput {
     fn add_char(&mut self, uni_char: u32) {
-        if let Some(character) = char::from_u32(uni_char) {
+        if let Some(character) = decode_text_input_char(uni_char, &mut self.pending_high_surrogate)
+        {
             self.queue.borrow_mut().push(character);
         }
+    }
+}
+
+fn decode_text_input_char(uni_char: u32, pending_high_surrogate: &mut Option<u16>) -> Option<char> {
+    match uni_char {
+        0xD800..=0xDBFF => {
+            *pending_high_surrogate = Some(uni_char as u16);
+            None
+        }
+        0xDC00..=0xDFFF => {
+            let high = pending_high_surrogate.take()? as u32;
+            let low = uni_char;
+            char::from_u32(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
+        }
+        _ => {
+            *pending_high_surrogate = None;
+            char::from_u32(normalize_legacy_pua_emoji(uni_char))
+        }
+    }
+}
+
+fn normalize_legacy_pua_emoji(uni_char: u32) -> u32 {
+    // Some Windows text paths can surface old BMP-private emoji code units;
+    // map the emoticon block back to the standard supplementary-plane range.
+    if (0xF600..=0xF64F).contains(&uni_char) {
+        uni_char + 0x10000
+    } else {
+        uni_char
     }
 }
 
@@ -360,6 +514,11 @@ fn handle_mouse(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -
     gui_state.mouse_was_down = mouse_down;
     if !mouse_down {
         gui_state.scroll_drag = None;
+        gui_state.mouse_selecting = false;
+        if app.selected_range().is_none() {
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
+        }
         return Ok(false);
     }
 
@@ -374,6 +533,11 @@ fn handle_mouse(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -
 
     if gui_state.scroll_drag.is_some() {
         update_scroll_drag(app, gui_state, width, height, x, y)?;
+        return Ok(false);
+    }
+
+    if gui_state.mouse_selecting {
+        update_mouse_selection(app, gui_state, width, height, x, y)?;
         return Ok(false);
     }
 
@@ -407,9 +571,40 @@ fn handle_mouse(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -
     }
 
     if let Some(offset) = text_offset_for_point(app, gui_state, width, height, x, y) {
-        app.set_caret_offset(offset)?;
+        if is_shift_down(window) {
+            let anchor = gui_state.selection_anchor.unwrap_or(app.caret_offset());
+            app.set_selection_range(anchor, offset)?;
+            gui_state.selection_anchor = Some(anchor);
+            gui_state.selection_focus = Some(offset);
+        } else {
+            app.set_caret_offset(offset)?;
+            gui_state.selection_anchor = Some(offset);
+            gui_state.selection_focus = Some(offset);
+        }
+        gui_state.mouse_selecting = true;
     }
     Ok(false)
+}
+
+fn update_mouse_selection(
+    app: &mut BlitzApp,
+    gui_state: &mut GuiState,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) -> Result<()> {
+    let Some(anchor) = gui_state.selection_anchor else {
+        return Ok(());
+    };
+    let Some(focus) = text_offset_for_point(app, gui_state, width, height, x, y) else {
+        return Ok(());
+    };
+    if gui_state.selection_focus == Some(focus) {
+        return Ok(());
+    }
+    gui_state.selection_focus = Some(focus);
+    app.set_selection_range(anchor, focus)
 }
 
 fn handle_scrollbar_click(
@@ -420,8 +615,7 @@ fn handle_scrollbar_click(
     x: usize,
     y: usize,
 ) -> Result<bool> {
-    let state = app.ui_state()?;
-    let Some(metrics) = editor_metrics(&state, width, height) else {
+    let Some(metrics) = editor_metrics_for_app(app, width, height) else {
         return Ok(false);
     };
 
@@ -496,8 +690,7 @@ fn update_scroll_drag(
     x: usize,
     y: usize,
 ) -> Result<()> {
-    let state = app.ui_state()?;
-    let Some(metrics) = editor_metrics(&state, width, height) else {
+    let Some(metrics) = editor_metrics_for_app(app, width, height) else {
         return Ok(());
     };
 
@@ -557,6 +750,373 @@ fn update_scroll_drag(
     Ok(())
 }
 
+fn open_find_window(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    if gui_state.find_window.is_some() {
+        return Ok(());
+    }
+
+    let input_queue = Rc::new(RefCell::new(Vec::new()));
+    let mut window = Window::new(
+        "Find",
+        FIND_WINDOW_WIDTH,
+        FIND_WINDOW_HEIGHT,
+        WindowOptions {
+            resize: false,
+            ..WindowOptions::default()
+        },
+    )
+    .map_err(|error| BlitzError::Window(error.to_string()))?;
+    window.set_input_callback(Box::new(TextInput::new(Rc::clone(&input_queue))));
+
+    let query = app
+        .selected_text()
+        .or_else(|| {
+            gui_state
+                .last_search
+                .as_ref()
+                .map(|search| search.query.clone())
+        })
+        .unwrap_or_default();
+    let (match_case, wrap_around) = gui_state
+        .last_search
+        .as_ref()
+        .map(|search| (search.match_case, search.wrap_around))
+        .unwrap_or((false, false));
+
+    gui_state.find_window = Some(FindWindowState {
+        window,
+        input_queue,
+        query,
+        match_case,
+        wrap_around,
+        forward: true,
+        mouse_was_down: false,
+    });
+    Ok(())
+}
+
+fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    let Some(mut find_window) = gui_state.find_window.take() else {
+        return Ok(());
+    };
+
+    let mut keep_open = find_window.window.is_open();
+    if keep_open {
+        keep_open = handle_find_window_keys(app, gui_state, &mut find_window);
+    }
+    if keep_open {
+        keep_open = handle_find_window_mouse(app, gui_state, &mut find_window);
+    }
+    if keep_open {
+        let frame = render_find_window(&find_window, &gui_state.fonts);
+        find_window
+            .window
+            .update_with_buffer(&frame.pixels, frame.width, frame.height)
+            .map_err(|error| BlitzError::Window(error.to_string()))?;
+        gui_state.find_window = Some(find_window);
+    }
+    Ok(())
+}
+
+fn handle_find_window_keys(
+    app: &mut BlitzApp,
+    gui_state: &mut GuiState,
+    find_window: &mut FindWindowState,
+) -> bool {
+    if find_window
+        .window
+        .is_key_pressed(Key::Escape, KeyRepeat::No)
+    {
+        return false;
+    }
+    if find_window.window.is_key_pressed(Key::Enter, KeyRepeat::No)
+        || find_window
+            .window
+            .is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
+    {
+        if let Err(error) = run_find_from_window(app, gui_state, find_window) {
+            show_find_error(gui_state, error);
+        }
+    }
+    if find_window
+        .window
+        .is_key_pressed(Key::Backspace, KeyRepeat::Yes)
+    {
+        find_window.query.pop();
+    }
+    if find_window.window.is_key_pressed(Key::Up, KeyRepeat::No) {
+        find_window.forward = false;
+    }
+    if find_window.window.is_key_pressed(Key::Down, KeyRepeat::No) {
+        find_window.forward = true;
+    }
+
+    let characters = find_window
+        .input_queue
+        .borrow_mut()
+        .drain(..)
+        .collect::<Vec<_>>();
+    for character in characters {
+        if !character.is_control() {
+            find_window.query.push(character);
+        }
+    }
+    true
+}
+
+fn handle_find_window_mouse(
+    app: &mut BlitzApp,
+    gui_state: &mut GuiState,
+    find_window: &mut FindWindowState,
+) -> bool {
+    let mouse_down = find_window.window.get_mouse_down(MouseButton::Left);
+    let clicked = mouse_down && !find_window.mouse_was_down;
+    find_window.mouse_was_down = mouse_down;
+    if !clicked {
+        return true;
+    }
+
+    let Some((mouse_x, mouse_y)) = find_window.window.get_mouse_pos(MouseMode::Discard) else {
+        return true;
+    };
+    let x = mouse_x as usize;
+    let y = mouse_y as usize;
+
+    if hit_rect(x, y, FIND_NEXT_BUTTON_RECT) {
+        if !find_window.query.is_empty() {
+            if let Err(error) = run_find_from_window(app, gui_state, find_window) {
+                show_find_error(gui_state, error);
+            }
+        }
+    } else if hit_rect(x, y, FIND_CANCEL_BUTTON_RECT) {
+        return false;
+    } else if hit_rect(x, y, FIND_MATCH_CASE_RECT) {
+        find_window.match_case = !find_window.match_case;
+    } else if hit_rect(x, y, FIND_WRAP_RECT) {
+        find_window.wrap_around = !find_window.wrap_around;
+    } else if hit_rect(x, y, FIND_UP_RADIO_RECT) {
+        find_window.forward = false;
+    } else if hit_rect(x, y, FIND_DOWN_RADIO_RECT) {
+        find_window.forward = true;
+    }
+
+    true
+}
+
+fn run_find_from_window(
+    app: &mut BlitzApp,
+    gui_state: &mut GuiState,
+    find_window: &FindWindowState,
+) -> Result<()> {
+    if find_window.query.is_empty() {
+        return Ok(());
+    }
+
+    if app.find_text_with_options(
+        &find_window.query,
+        find_window.match_case,
+        find_window.forward,
+        find_window.wrap_around,
+    )? {
+        gui_state.last_search = Some(SearchSpec {
+            query: find_window.query.clone(),
+            match_case: find_window.match_case,
+            wrap_around: find_window.wrap_around,
+        });
+        gui_state.set_message("Found");
+    } else {
+        gui_state.set_message("Cannot find text");
+    }
+    Ok(())
+}
+
+fn show_find_error(gui_state: &mut GuiState, error: BlitzError) {
+    gui_state.dialog = Some(DialogState::Info {
+        title: "Find".to_owned(),
+        message: format!("Find failed: {error}"),
+    });
+}
+
+fn hit_rect(x: usize, y: usize, rect: Rect) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+fn render_find_window(find_window: &FindWindowState, fonts: &FontStack) -> RenderFrame {
+    render_find_window_view(&find_window.view(), fonts)
+}
+
+fn render_find_window_view(view: &FindWindowView, fonts: &FontStack) -> RenderFrame {
+    let mut canvas = Canvas::new(FIND_WINDOW_WIDTH, FIND_WINDOW_HEIGHT, COLOR_WINDOW);
+    canvas.text(16, 22, "Find what:", COLOR_TEXT, TextRole::Find, fonts);
+    draw_find_text_field(&mut canvas, fonts, &view.query);
+    draw_find_button(
+        &mut canvas,
+        fonts,
+        FIND_NEXT_BUTTON_RECT,
+        "Find Next",
+        !view.query.is_empty(),
+    );
+    draw_find_button(&mut canvas, fonts, FIND_CANCEL_BUTTON_RECT, "Cancel", true);
+
+    draw_checkbox(
+        &mut canvas,
+        fonts,
+        FIND_MATCH_CASE_RECT,
+        "Match case",
+        view.match_case,
+    );
+    draw_checkbox(
+        &mut canvas,
+        fonts,
+        FIND_WRAP_RECT,
+        "Wrap around",
+        view.wrap_around,
+    );
+    draw_group_box(&mut canvas, fonts, FIND_DIRECTION_GROUP_RECT, "Direction");
+    draw_radio_button(&mut canvas, fonts, FIND_UP_RADIO_RECT, "Up", !view.forward);
+    draw_radio_button(
+        &mut canvas,
+        fonts,
+        FIND_DOWN_RADIO_RECT,
+        "Down",
+        view.forward,
+    );
+    canvas.into_frame()
+}
+
+fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str) {
+    canvas.fill_rect(
+        FIND_FIELD_RECT.x,
+        FIND_FIELD_RECT.y,
+        FIND_FIELD_RECT.width,
+        FIND_FIELD_RECT.height,
+        COLOR_TEXT_AREA,
+    );
+    canvas.rect(
+        FIND_FIELD_RECT.x,
+        FIND_FIELD_RECT.y,
+        FIND_FIELD_RECT.width,
+        FIND_FIELD_RECT.height,
+        0x000078d7,
+    );
+    let visible = text_prefix_for_width(
+        fonts,
+        query,
+        TextRole::Find,
+        FIND_FIELD_RECT.width.saturating_sub(12),
+    );
+    canvas.text(
+        FIND_FIELD_RECT.x + 6,
+        FIND_FIELD_RECT.y + 6,
+        visible,
+        COLOR_TEXT,
+        TextRole::Find,
+        fonts,
+    );
+    let caret_x = (FIND_FIELD_RECT.x + 6 + fonts.measure(visible, TextRole::Find))
+        .min(FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4);
+    canvas.fill_rect(
+        caret_x,
+        FIND_FIELD_RECT.y + 4,
+        2,
+        FIND_FIELD_RECT.height - 8,
+        COLOR_CARET,
+    );
+}
+
+fn draw_find_button(
+    canvas: &mut Canvas,
+    fonts: &FontStack,
+    rect: Rect,
+    label: &str,
+    enabled: bool,
+) {
+    canvas.fill_rect(rect.x, rect.y, rect.width, rect.height, COLOR_BUTTON);
+    canvas.rect(rect.x, rect.y, rect.width, rect.height, COLOR_BORDER);
+    let text_color = if enabled {
+        COLOR_TEXT
+    } else {
+        COLOR_DISABLED_TEXT
+    };
+    let label = text_prefix_for_width(fonts, label, TextRole::Find, rect.width.saturating_sub(8));
+    let text_x = rect.x
+        + rect
+            .width
+            .saturating_sub(fonts.measure(label, TextRole::Find))
+            / 2;
+    canvas.text(text_x, rect.y + 5, label, text_color, TextRole::Find, fonts);
+}
+
+fn draw_checkbox(canvas: &mut Canvas, fonts: &FontStack, rect: Rect, label: &str, checked: bool) {
+    canvas.fill_rect(rect.x, rect.y + 3, 14, 14, COLOR_TEXT_AREA);
+    canvas.rect(rect.x, rect.y + 3, 14, 14, COLOR_TEXT);
+    if checked {
+        canvas.line(rect.x + 3, rect.y + 10, rect.x + 6, rect.y + 14, COLOR_TEXT);
+        canvas.line(rect.x + 6, rect.y + 14, rect.x + 12, rect.y + 5, COLOR_TEXT);
+    }
+    canvas.text(
+        rect.x + 22,
+        rect.y + 1,
+        label,
+        COLOR_TEXT,
+        TextRole::Find,
+        fonts,
+    );
+}
+
+fn draw_group_box(canvas: &mut Canvas, fonts: &FontStack, rect: Rect, label: &str) {
+    canvas.rect(rect.x, rect.y, rect.width, rect.height, COLOR_GROUP_BOX);
+    canvas.fill_rect(
+        rect.x + 12,
+        rect.y,
+        fonts.measure(label, TextRole::Find) + 8,
+        14,
+        COLOR_WINDOW,
+    );
+    canvas.text(
+        rect.x + 16,
+        rect.y - 2,
+        label,
+        COLOR_TEXT,
+        TextRole::Find,
+        fonts,
+    );
+}
+
+fn draw_radio_button(
+    canvas: &mut Canvas,
+    fonts: &FontStack,
+    rect: Rect,
+    label: &str,
+    checked: bool,
+) {
+    let cx = rect.x + 8;
+    let cy = rect.y + 12;
+    draw_circle(canvas, cx as i32, cy as i32, 7, COLOR_TEXT);
+    if checked {
+        canvas.fill_rect(cx - 3, cy - 3, 6, 6, COLOR_TEXT);
+    }
+    canvas.text(
+        rect.x + 20,
+        rect.y + 3,
+        label,
+        COLOR_TEXT,
+        TextRole::Find,
+        fonts,
+    );
+}
+
+fn draw_circle(canvas: &mut Canvas, center_x: i32, center_y: i32, radius: i32, color: u32) {
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            let distance = x * x + y * y;
+            if distance >= radius * radius - radius && distance <= radius * radius + radius {
+                canvas.set_pixel(center_x + x, center_y + y, color);
+            }
+        }
+    }
+}
+
 fn handle_scroll_wheel(
     window: &Window,
     app: &BlitzApp,
@@ -567,8 +1127,7 @@ fn handle_scroll_wheel(
     let Some((scroll_x, scroll_y)) = window.get_scroll_wheel() else {
         return Ok(());
     };
-    let state = app.ui_state()?;
-    let Some(metrics) = editor_metrics(&state, width, height) else {
+    let Some(metrics) = editor_metrics_for_app(app, width, height) else {
         return Ok(());
     };
 
@@ -597,8 +1156,8 @@ fn scroll_page(
     direction: isize,
 ) -> Result<()> {
     let (width, height) = window.get_size();
-    let state = app.ui_state()?;
-    if let Some(metrics) = editor_metrics(&state, width.max(MIN_WIDTH), height.max(MIN_HEIGHT)) {
+    if let Some(metrics) = editor_metrics_for_app(app, width.max(MIN_WIDTH), height.max(MIN_HEIGHT))
+    {
         gui_state.scroll_vertical(
             app,
             direction * metrics.visible_line_count as isize,
@@ -644,19 +1203,7 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
             });
         }
         if window.is_key_pressed(Key::F, KeyRepeat::No) {
-            gui_state.dialog = Some(DialogState::Find {
-                query: app
-                    .selected_text()
-                    .or_else(|| {
-                        gui_state
-                            .last_search
-                            .as_ref()
-                            .map(|search| search.query.clone())
-                    })
-                    .unwrap_or_default(),
-                match_case: false,
-                forward: true,
-            });
+            open_find_window(app, gui_state)?;
         }
         if window.is_key_pressed(Key::H, KeyRepeat::No) {
             gui_state.dialog = Some(DialogState::Replace {
@@ -674,7 +1221,7 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
                 match_case: false,
             });
         }
-        if window.is_key_pressed(Key::G, KeyRepeat::No) && !app.ui_state()?.word_wrap {
+        if window.is_key_pressed(Key::G, KeyRepeat::No) && !app.settings().word_wrap {
             gui_state.dialog = Some(DialogState::GoTo {
                 line: String::new(),
             });
@@ -684,10 +1231,14 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
         }
         if window.is_key_pressed(Key::A, KeyRepeat::No) {
             app.select_all();
+            gui_state.selection_anchor = Some(0);
+            gui_state.selection_focus = Some(app.caret_offset());
         }
         if window.is_key_pressed(Key::X, KeyRepeat::No) {
             if let Some(text) = app.cut_selection()? {
                 set_clipboard_text(gui_state, text);
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
                 gui_state.set_message("Cut");
             }
         }
@@ -699,9 +1250,13 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
         }
         if window.is_key_pressed(Key::V, KeyRepeat::No) {
             paste_from_clipboard(app, gui_state)?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
         }
         if window.is_key_pressed(Key::Z, KeyRepeat::No) {
             app.undo()?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
         }
         if window.is_key_pressed(Key::Key0, KeyRepeat::No)
             || window.is_key_pressed(Key::NumPad0, KeyRepeat::No)
@@ -723,29 +1278,71 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
 
     for key in window.get_keys_pressed(KeyRepeat::Yes) {
         match key {
-            Key::Left => app.move_left()?,
-            Key::Right => app.move_right()?,
-            Key::Up => app.move_up()?,
-            Key::Down => app.move_down()?,
+            Key::Left => move_caret_with_selection(window, app, gui_state, |app| app.move_left())?,
+            Key::Right => {
+                move_caret_with_selection(window, app, gui_state, |app| app.move_right())?
+            }
+            Key::Up => move_caret_with_selection(window, app, gui_state, |app| app.move_up())?,
+            Key::Down => move_caret_with_selection(window, app, gui_state, |app| app.move_down())?,
             Key::PageUp => scroll_page(window, app, gui_state, -1)?,
             Key::PageDown => scroll_page(window, app, gui_state, 1)?,
-            Key::Home => app.move_line_start()?,
-            Key::End => app.move_line_end()?,
+            Key::Home => {
+                move_caret_with_selection(window, app, gui_state, |app| app.move_line_start())?
+            }
+            Key::End => {
+                move_caret_with_selection(window, app, gui_state, |app| app.move_line_end())?
+            }
             Key::Backspace => {
                 app.backspace()?;
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
             }
             Key::Delete => {
                 app.delete_forward()?;
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
             }
-            Key::Enter | Key::NumPadEnter => app.insert_text("\n")?,
-            Key::Tab => app.insert_text("\t")?,
-            Key::F5 => app.insert_time_date()?,
+            Key::Enter | Key::NumPadEnter => {
+                app.insert_text("\n")?;
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
+            }
+            Key::Tab => {
+                app.insert_text("\t")?;
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
+            }
+            Key::F5 => {
+                app.insert_time_date()?;
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
+            }
             _ => {}
         }
     }
 
     if window.is_key_pressed(Key::F3, KeyRepeat::No) {
         find_again(app, gui_state, !is_shift_down(window))?;
+    }
+    Ok(())
+}
+
+fn move_caret_with_selection(
+    window: &Window,
+    app: &mut BlitzApp,
+    gui_state: &mut GuiState,
+    move_caret: impl FnOnce(&mut BlitzApp) -> Result<()>,
+) -> Result<()> {
+    let anchor =
+        is_shift_down(window).then(|| gui_state.selection_anchor.unwrap_or(app.caret_offset()));
+    move_caret(app)?;
+    if let Some(anchor) = anchor {
+        app.set_selection_range(anchor, app.caret_offset())?;
+        gui_state.selection_anchor = Some(anchor);
+        gui_state.selection_focus = Some(app.caret_offset());
+    } else {
+        gui_state.selection_anchor = None;
+        gui_state.selection_focus = None;
     }
     Ok(())
 }
@@ -775,6 +1372,8 @@ fn handle_text_input(
     for character in characters {
         if !character.is_control() {
             app.insert_text(&character.to_string())?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
         }
     }
     Ok(())
@@ -805,7 +1404,6 @@ fn handle_dialog_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiSt
 
 fn append_dialog_character(gui_state: &mut GuiState, character: char) {
     match gui_state.dialog.as_mut() {
-        Some(DialogState::Find { query, .. }) => query.push(character),
         Some(DialogState::Replace {
             query,
             replacement,
@@ -822,9 +1420,6 @@ fn append_dialog_character(gui_state: &mut GuiState, character: char) {
 
 fn backspace_dialog_field(gui_state: &mut GuiState) {
     match gui_state.dialog.as_mut() {
-        Some(DialogState::Find { query, .. }) => {
-            query.pop();
-        }
         Some(DialogState::Replace {
             query,
             replacement,
@@ -856,18 +1451,6 @@ fn tab_dialog_field(gui_state: &mut GuiState) {
 
 fn toggle_dialog_option(gui_state: &mut GuiState) {
     match gui_state.dialog.as_mut() {
-        Some(DialogState::Find {
-            match_case,
-            forward,
-            ..
-        }) => {
-            if *match_case {
-                *match_case = false;
-                *forward = !*forward;
-            } else {
-                *match_case = true;
-            }
-        }
         Some(DialogState::Replace { match_case, .. }) => *match_case = !*match_case,
         _ => {}
     }
@@ -879,18 +1462,6 @@ fn accept_dialog(app: &mut BlitzApp, gui_state: &mut GuiState, command_down: boo
     };
 
     match dialog {
-        DialogState::Find {
-            query,
-            match_case,
-            forward,
-        } => {
-            if app.find_text(&query, match_case, forward)? {
-                gui_state.last_search = Some(SearchSpec { query, match_case });
-                gui_state.set_message("Found");
-            } else {
-                gui_state.set_message("Cannot find text");
-            }
-        }
         DialogState::Replace {
             query,
             replacement,
@@ -900,6 +1471,7 @@ fn accept_dialog(app: &mut BlitzApp, gui_state: &mut GuiState, command_down: boo
             gui_state.last_search = Some(SearchSpec {
                 query: query.clone(),
                 match_case,
+                wrap_around: true,
             });
             if command_down {
                 let count = app.replace_all(&query, &replacement, match_case)?;
@@ -976,10 +1548,14 @@ fn execute_menu_row(
         ("File", "Exit") => return confirm_unsaved_changes(app, gui_state),
         ("Edit", "Undo") => {
             app.undo()?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
         }
         ("Edit", "Cut") => {
             if let Some(text) = app.cut_selection()? {
                 set_clipboard_text(gui_state, text);
+                gui_state.selection_anchor = None;
+                gui_state.selection_focus = None;
                 gui_state.set_message("Cut");
             }
         }
@@ -991,27 +1567,27 @@ fn execute_menu_row(
         }
         ("Edit", "Paste") => {
             paste_from_clipboard(app, gui_state)?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
         }
         ("Edit", "Delete") => {
             app.delete_forward()?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
         }
-        ("Edit", "Select All") => app.select_all(),
-        ("Edit", "Time/Date") => app.insert_time_date()?,
+        ("Edit", "Select All") => {
+            app.select_all();
+            gui_state.selection_anchor = Some(0);
+            gui_state.selection_focus = Some(app.caret_offset());
+        }
+        ("Edit", "Time/Date") => {
+            app.insert_time_date()?;
+            gui_state.selection_anchor = None;
+            gui_state.selection_focus = None;
+        }
         ("Edit", "Search with Bing...") => search_with_bing(app, gui_state),
         ("Edit", "Find...") => {
-            gui_state.dialog = Some(DialogState::Find {
-                query: app
-                    .selected_text()
-                    .or_else(|| {
-                        gui_state
-                            .last_search
-                            .as_ref()
-                            .map(|search| search.query.clone())
-                    })
-                    .unwrap_or_default(),
-                match_case: false,
-                forward: true,
-            });
+            open_find_window(app, gui_state)?;
         }
         ("Edit", "Find Next") => find_again(app, gui_state, true)?,
         ("Edit", "Find Previous") => find_again(app, gui_state, false)?,
@@ -1065,7 +1641,12 @@ fn find_again(app: &mut BlitzApp, gui_state: &mut GuiState, forward: bool) -> Re
         gui_state.set_message("No active search");
         return Ok(());
     };
-    if app.find_text(&search.query, search.match_case, forward)? {
+    if app.find_text_with_options(
+        &search.query,
+        search.match_case,
+        forward,
+        search.wrap_around,
+    )? {
         gui_state.set_message("Found");
     } else {
         gui_state.set_message("Cannot find text");
@@ -1465,7 +2046,7 @@ fn draw_dialog(canvas: &mut Canvas, dialog: &DialogState, fonts: &FontStack) {
     let height = match dialog {
         DialogState::Replace { .. } => 180,
         DialogState::Info { .. } => 160,
-        _ => 140,
+        DialogState::GoTo { .. } => 140,
     };
     let x = (canvas.width.saturating_sub(width)) / 2;
     let y = (canvas.height.saturating_sub(height)) / 2;
@@ -1475,34 +2056,6 @@ fn draw_dialog(canvas: &mut Canvas, dialog: &DialogState, fonts: &FontStack) {
     canvas.rect(x, y, width, height, COLOR_BORDER);
 
     match dialog {
-        DialogState::Find {
-            query,
-            match_case,
-            forward,
-        } => {
-            canvas.text(x + 16, y + 12, "Find", COLOR_TEXT, TextRole::Ui, fonts);
-            draw_text_field(canvas, fonts, x + 16, y + 44, width - 32, query, true);
-            canvas.text(
-                x + 16,
-                y + 82,
-                &format!(
-                    "[Space] Match case: {}   Direction: {}",
-                    on_off(*match_case),
-                    if *forward { "Down" } else { "Up" }
-                ),
-                COLOR_TEXT,
-                TextRole::Ui,
-                fonts,
-            );
-            canvas.text(
-                x + 16,
-                y + 112,
-                "Enter: Find   Esc: Close",
-                COLOR_TEXT,
-                TextRole::Ui,
-                fonts,
-            );
-        }
         DialogState::Replace {
             query,
             replacement,
@@ -1645,11 +2198,25 @@ struct EditorMetrics {
 }
 
 fn editor_metrics(state: &NotepadUiState, width: usize, height: usize) -> Option<EditorMetrics> {
-    let status_height = if state.status_bar_visible {
-        STATUS_HEIGHT
-    } else {
-        0
-    };
+    editor_metrics_from_flags(state.status_bar_visible, state.word_wrap, width, height)
+}
+
+fn editor_metrics_for_app(app: &BlitzApp, width: usize, height: usize) -> Option<EditorMetrics> {
+    editor_metrics_from_flags(
+        app.settings().status_bar_visible,
+        app.settings().word_wrap,
+        width,
+        height,
+    )
+}
+
+fn editor_metrics_from_flags(
+    status_bar_visible: bool,
+    word_wrap: bool,
+    width: usize,
+    height: usize,
+) -> Option<EditorMetrics> {
+    let status_height = if status_bar_visible { STATUS_HEIGHT } else { 0 };
     let text_top = text_top();
     let text_bottom = height.saturating_sub(status_height + 1);
     if text_bottom <= text_top {
@@ -1657,7 +2224,7 @@ fn editor_metrics(state: &NotepadUiState, width: usize, height: usize) -> Option
     }
 
     let text_width = width.saturating_sub(SCROLLBAR_WIDTH);
-    let horizontal_scroll_y = (!state.word_wrap && text_bottom > text_top + SCROLLBAR_WIDTH)
+    let horizontal_scroll_y = (!word_wrap && text_bottom > text_top + SCROLLBAR_WIDTH)
         .then(|| text_bottom.saturating_sub(SCROLLBAR_WIDTH));
     let editor_bottom = horizontal_scroll_y.unwrap_or(text_bottom);
     if editor_bottom <= text_top {
@@ -1856,6 +2423,7 @@ fn draw_text_area(
         metrics.visible_line_count,
         gui_state.horizontal_offset,
     );
+    draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
     for (index, line) in visible_lines.iter().enumerate() {
         let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
         let text = text_prefix_for_width(
@@ -1883,9 +2451,52 @@ fn draw_text_area(
         let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
         let visible_prefix =
             text_prefix_for_width(fonts, prefix, TextRole::Editor, metrics.editor_text_width);
-        let caret_x = TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor);
+        let caret_x = (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor))
+            .min(TEXT_MARGIN_X + metrics.editor_text_width);
         let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
         draw_caret(canvas, caret_x, y);
+    }
+}
+
+fn draw_selection_highlights(
+    canvas: &mut Canvas,
+    app: &BlitzApp,
+    visible_lines: &[crate::document::VisibleLine],
+    metrics: EditorMetrics,
+    fonts: &FontStack,
+) {
+    let Some(selection) = app.selected_range() else {
+        return;
+    };
+
+    for (index, line) in visible_lines.iter().enumerate() {
+        let start = selection.start.max(line.byte_range.start);
+        let end = selection.end.min(line.byte_range.end);
+        if start >= end {
+            continue;
+        }
+
+        let local_start = start
+            .saturating_sub(line.byte_range.start)
+            .min(line.text.len());
+        let local_end = end
+            .saturating_sub(line.byte_range.start)
+            .min(line.text.len());
+        let Some(prefix) = line.text.get(..local_start) else {
+            continue;
+        };
+        let Some(selected) = line.text.get(local_start..local_end) else {
+            continue;
+        };
+        let x = TEXT_MARGIN_X + fonts.measure(prefix, TextRole::Editor);
+        let selection_right = (x + fonts.measure(selected, TextRole::Editor).max(1))
+            .min(TEXT_MARGIN_X + metrics.editor_text_width);
+        if selection_right <= x {
+            continue;
+        }
+        let width = selection_right - x;
+        let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
+        canvas.fill_rect(x, y, width, EDITOR_LINE_HEIGHT, COLOR_SELECTION);
     }
 }
 
@@ -1897,11 +2508,12 @@ fn text_prefix_for_width<'a>(
 ) -> &'a str {
     let limit = max_width as f32;
     let mut width = 0.0f32;
-    for (index, character) in text.char_indices() {
-        width += fonts.measure_char(character, role);
-        if width > limit {
-            return &text[..index];
+    for unit in text_units(text) {
+        let next_width = width + fonts.measure_unit(unit, role);
+        if next_width > limit {
+            return &text[..unit.start];
         }
+        width = next_width;
     }
     text
 }
@@ -1918,8 +2530,7 @@ fn text_offset_for_point(
     x: usize,
     y: usize,
 ) -> Option<usize> {
-    let state = app.ui_state().ok()?;
-    let metrics = editor_metrics(&state, width, height)?;
+    let metrics = editor_metrics_for_app(app, width, height)?;
     if y < metrics.text_top + TEXT_MARGIN_Y || y >= metrics.editor_bottom || x >= metrics.text_width
     {
         return None;
@@ -1929,18 +2540,17 @@ fn text_offset_for_point(
     let first_visible_line = gui_state
         .first_visible_line
         .min(max_first_visible_line(app, metrics.visible_line_count));
-    let visible_lines = app.document().visible_lines_at(
-        first_visible_line,
-        metrics.visible_line_count,
-        gui_state.horizontal_offset,
-    );
-    if visible_lines.is_empty() {
+    let document_line = first_visible_line
+        .saturating_add(line_index)
+        .min(app.document().line_count().saturating_sub(1));
+    let visible_line = app
+        .document()
+        .visible_lines_at(document_line, 1, gui_state.horizontal_offset)
+        .into_iter()
+        .next();
+    let Some(line) = visible_line else {
         return Some(0);
-    }
-
-    let line = visible_lines
-        .get(line_index)
-        .or_else(|| visible_lines.last())?;
+    };
     let target_x = x.saturating_sub(TEXT_MARGIN_X) as f32;
     Some(offset_for_x(
         &gui_state.fonts,
@@ -1952,12 +2562,15 @@ fn text_offset_for_point(
 
 fn offset_for_x(fonts: &FontStack, line: &str, line_start: usize, target_x: f32) -> usize {
     let mut cursor = 0.0f32;
-    for (index, character) in line.char_indices() {
-        let advance = fonts.measure_char(character, TextRole::Editor);
+    for unit in text_units(line) {
+        let advance = fonts.measure_unit(unit, TextRole::Editor);
         if target_x < cursor + advance / 2.0 {
-            return line_start + index;
+            return line_start + unit.start;
         }
         cursor += advance;
+        if target_x < cursor {
+            return line_start + unit.end;
+        }
     }
     line_start + line.len()
 }
@@ -2123,6 +2736,7 @@ fn text_top() -> usize {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TextRole {
     Ui,
+    Find,
     Editor,
 }
 
@@ -2130,11 +2744,16 @@ enum TextRole {
 struct LoadedFont {
     name: String,
     font: FontArc,
+    data: Arc<[u8]>,
+    face_index: usize,
 }
 
 struct FontStack {
     fonts: Vec<LoadedFont>,
     glyph_cache: RefCell<HashMap<GlyphCacheKey, GlyphMetrics>>,
+    emoji_cluster_cache: RefCell<HashMap<EmojiClusterKey, Option<EmojiClusterMetrics>>>,
+    scale_context: RefCell<ScaleContext>,
+    shape_context: RefCell<ShapeContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2146,8 +2765,45 @@ struct GlyphCacheKey {
 #[derive(Clone, Copy, Debug)]
 struct GlyphMetrics {
     font_index: usize,
-    glyph_id: GlyphId,
+    glyph_id: AbGlyphId,
     advance: f32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EmojiClusterKey {
+    text: String,
+    role: TextRole,
+}
+
+#[derive(Clone, Debug)]
+struct EmojiClusterMetrics {
+    font_index: usize,
+    glyphs: Vec<EmojiClusterGlyph>,
+    advance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EmojiClusterGlyph {
+    id: SwashGlyphId,
+    x: f32,
+    y: f32,
+    advance: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextUnit<'a> {
+    text: &'a str,
+    first: char,
+    start: usize,
+    end: usize,
+    kind: TextUnitKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextUnitKind {
+    Character,
+    EmojiCluster,
+    Ignorable,
 }
 
 impl FontStack {
@@ -2188,6 +2844,9 @@ impl FontStack {
         Ok(Self {
             fonts,
             glyph_cache: RefCell::new(HashMap::new()),
+            emoji_cluster_cache: RefCell::new(HashMap::new()),
+            scale_context: RefCell::new(ScaleContext::new()),
+            shape_context: RefCell::new(ShapeContext::new()),
         })
     }
 
@@ -2203,6 +2862,7 @@ impl FontStack {
     fn size(&self, role: TextRole) -> f32 {
         match role {
             TextRole::Ui => UI_FONT_SIZE,
+            TextRole::Find => FIND_FONT_SIZE,
             TextRole::Editor => EDITOR_FONT_SIZE,
         }
     }
@@ -2212,7 +2872,25 @@ impl FontStack {
     }
 
     fn measure_text(&self, text: &str, role: TextRole) -> f32 {
+        text_units(text)
+            .map(|unit| self.measure_unit(unit, role))
+            .sum()
+    }
+
+    fn measure_unit(&self, unit: TextUnit<'_>, role: TextRole) -> f32 {
+        match unit.kind {
+            TextUnitKind::EmojiCluster => self
+                .emoji_cluster_metrics(unit.text, role)
+                .map(|metrics| metrics.advance)
+                .unwrap_or_else(|| self.measure_text_by_char(unit.text, role)),
+            TextUnitKind::Ignorable => 0.0,
+            TextUnitKind::Character => self.measure_char(unit.first, role),
+        }
+    }
+
+    fn measure_text_by_char(&self, text: &str, role: TextRole) -> f32 {
         text.chars()
+            .filter(|character| !is_default_ignorable_for_display(*character))
             .map(|character| self.measure_char(character, role))
             .sum()
     }
@@ -2220,6 +2898,9 @@ impl FontStack {
     fn measure_char(&self, character: char, role: TextRole) -> f32 {
         if character == '\t' {
             return self.measure_char(' ', role) * 4.0;
+        }
+        if is_default_ignorable_for_display(character) {
+            return 0.0;
         }
         self.glyph_metrics(character, role).advance
     }
@@ -2235,28 +2916,87 @@ impl FontStack {
     ) {
         let size = self.size(role);
         let mut cursor = x;
+        for unit in text_units(text) {
+            match unit.kind {
+                TextUnitKind::EmojiCluster => {
+                    if let Some(metrics) = self.emoji_cluster_metrics(unit.text, role) {
+                        self.draw_emoji_cluster(canvas, &metrics, cursor, baseline, role);
+                        cursor += metrics.advance;
+                    } else {
+                        cursor += self
+                            .draw_text_by_char(canvas, cursor, baseline, unit.text, color, role);
+                    }
+                }
+                TextUnitKind::Ignorable => {}
+                TextUnitKind::Character => {
+                    if unit.first == '\t' {
+                        cursor += self.measure_char(unit.first, role);
+                    } else {
+                        let metrics = self.glyph_metrics(unit.first, role);
+                        self.draw_outline_or_missing(
+                            canvas, unit.first, &metrics, cursor, baseline, size, color,
+                        );
+                        cursor += metrics.advance;
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_text_by_char(
+        &self,
+        canvas: &mut Canvas,
+        mut cursor: f32,
+        baseline: f32,
+        text: &str,
+        color: u32,
+        role: TextRole,
+    ) -> f32 {
+        let start = cursor;
+        let size = self.size(role);
         for character in text.chars() {
+            if is_default_ignorable_for_display(character) {
+                continue;
+            }
             if character == '\t' {
                 cursor += self.measure_char(character, role);
                 continue;
             }
             let metrics = self.glyph_metrics(character, role);
-            let font = &self.fonts[metrics.font_index].font;
-            let glyph = metrics
-                .glyph_id
-                .with_scale_and_position(size, point(cursor, baseline));
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|glyph_x, glyph_y, coverage| {
-                    canvas.blend_pixel(
-                        bounds.min.x as i32 + glyph_x as i32,
-                        bounds.min.y as i32 + glyph_y as i32,
-                        color,
-                        coverage,
-                    );
-                });
-            }
+            self.draw_outline_or_missing(
+                canvas, character, &metrics, cursor, baseline, size, color,
+            );
             cursor += metrics.advance;
+        }
+        cursor - start
+    }
+
+    fn draw_outline_or_missing(
+        &self,
+        canvas: &mut Canvas,
+        character: char,
+        metrics: &GlyphMetrics,
+        cursor: f32,
+        baseline: f32,
+        size: f32,
+        color: u32,
+    ) {
+        let font = &self.fonts[metrics.font_index].font;
+        let glyph = metrics
+            .glyph_id
+            .with_scale_and_position(size, point(cursor, baseline));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|glyph_x, glyph_y, coverage| {
+                canvas.blend_pixel(
+                    bounds.min.x as i32 + glyph_x as i32,
+                    bounds.min.y as i32 + glyph_y as i32,
+                    color,
+                    coverage,
+                );
+            });
+        } else if !character.is_whitespace() {
+            draw_missing_glyph_box(canvas, cursor, baseline, metrics.advance, size, color);
         }
     }
 
@@ -2266,7 +3006,7 @@ impl FontStack {
             return *metrics;
         }
 
-        let (font_index, glyph_id) = self.font_index_for(character);
+        let (font_index, glyph_id, _color_glyph_id) = self.font_index_for(character, role);
         let size = self.size(role);
         let advance = self.fonts[font_index]
             .font
@@ -2282,16 +3022,354 @@ impl FontStack {
         metrics
     }
 
-    fn font_index_for(&self, character: char) -> (usize, GlyphId) {
+    fn font_index_for(&self, character: char, role: TextRole) -> (usize, AbGlyphId, SwashGlyphId) {
+        let size = self.size(role);
+        let first_supported = self.fonts.iter().enumerate().find_map(|(index, loaded)| {
+            let glyph_id = loaded.font.glyph_id(character);
+            let color_glyph_id = self.swash_glyph_id(index, character);
+            (glyph_id != AbGlyphId(0) || color_glyph_id != 0).then_some((
+                index,
+                glyph_id,
+                color_glyph_id,
+            ))
+        });
+
+        if character.is_whitespace() {
+            return first_supported.unwrap_or_else(|| {
+                (
+                    0,
+                    self.fonts[0].font.glyph_id(character),
+                    self.swash_glyph_id(0, character),
+                )
+            });
+        }
+
         self.fonts
             .iter()
             .enumerate()
             .find_map(|(index, loaded)| {
                 let glyph_id = loaded.font.glyph_id(character);
-                (glyph_id != GlyphId(0)).then_some((index, glyph_id))
+                let color_glyph_id = self.swash_glyph_id(index, character);
+                if glyph_id == AbGlyphId(0) && color_glyph_id == 0 {
+                    return None;
+                }
+                if is_color_emoji_candidate(character)
+                    && color_glyph_id != 0
+                    && self
+                        .color_glyph_image(index, color_glyph_id, role)
+                        .is_some()
+                {
+                    return Some((index, glyph_id, color_glyph_id));
+                }
+                let glyph = glyph_id.with_scale_and_position(size, point(0.0, 0.0));
+                loaded.font.outline_glyph(glyph).is_some().then_some((
+                    index,
+                    glyph_id,
+                    color_glyph_id,
+                ))
             })
-            .unwrap_or_else(|| (0, self.fonts[0].font.glyph_id(character)))
+            .or(first_supported)
+            .unwrap_or_else(|| {
+                (
+                    0,
+                    self.fonts[0].font.glyph_id(character),
+                    self.swash_glyph_id(0, character),
+                )
+            })
     }
+
+    fn swash_font(&self, font_index: usize) -> Option<FontRef<'_>> {
+        let loaded = self.fonts.get(font_index)?;
+        FontRef::from_index(&loaded.data, loaded.face_index)
+    }
+
+    fn swash_glyph_id(&self, font_index: usize, character: char) -> SwashGlyphId {
+        self.swash_font(font_index)
+            .map(|font| font.charmap().map(character))
+            .unwrap_or(0)
+    }
+
+    fn color_glyph_image(
+        &self,
+        font_index: usize,
+        glyph_id: SwashGlyphId,
+        role: TextRole,
+    ) -> Option<swash::scale::image::Image> {
+        if glyph_id == 0 {
+            return None;
+        }
+
+        let font = self.swash_font(font_index)?;
+        let mut context = self.scale_context.borrow_mut();
+        let mut scaler = context
+            .builder(font)
+            .size(self.size(role))
+            .hint(true)
+            .build();
+        Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+        ])
+        .render(&mut scaler, glyph_id)
+        .filter(|image| image.content == Content::Color)
+    }
+
+    fn color_glyph_image_with_size(
+        &self,
+        font_index: usize,
+        glyph_id: SwashGlyphId,
+        size: f32,
+    ) -> Option<swash::scale::image::Image> {
+        if glyph_id == 0 {
+            return None;
+        }
+
+        let font = self.swash_font(font_index)?;
+        let mut context = self.scale_context.borrow_mut();
+        let mut scaler = context.builder(font).size(size).hint(true).build();
+        Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+        ])
+        .render(&mut scaler, glyph_id)
+        .filter(|image| image.content == Content::Color)
+    }
+
+    fn emoji_cluster_metrics(&self, text: &str, role: TextRole) -> Option<EmojiClusterMetrics> {
+        let key = EmojiClusterKey {
+            text: text.to_owned(),
+            role,
+        };
+        if let Some(metrics) = self.emoji_cluster_cache.borrow().get(&key) {
+            return metrics.clone();
+        }
+
+        let metrics = self.shape_emoji_cluster(text, role);
+        self.emoji_cluster_cache
+            .borrow_mut()
+            .insert(key, metrics.clone());
+        metrics
+    }
+
+    fn shape_emoji_cluster(&self, text: &str, role: TextRole) -> Option<EmojiClusterMetrics> {
+        for font_index in 0..self.fonts.len() {
+            let Some(font) = self.swash_font(font_index) else {
+                continue;
+            };
+            let mut glyphs = Vec::new();
+            {
+                let mut context = self.shape_context.borrow_mut();
+                let mut shaper = context
+                    .builder(font)
+                    .script(Script::Latin)
+                    .direction(Direction::LeftToRight)
+                    .size(self.emoji_size(role))
+                    .build();
+                shaper.add_str(text);
+                shaper.shape_with(|cluster| {
+                    glyphs.extend(cluster.glyphs.iter().map(|glyph| EmojiClusterGlyph {
+                        id: glyph.id,
+                        x: glyph.x,
+                        y: glyph.y,
+                        advance: glyph.advance,
+                    }));
+                });
+            }
+
+            if glyphs.is_empty() {
+                continue;
+            }
+            if text.contains('\u{200d}') && glyphs.len() != 1 {
+                continue;
+            }
+            let has_color = glyphs.iter().any(|glyph| {
+                self.color_glyph_image_with_size(font_index, glyph.id, self.emoji_size(role))
+                    .is_some()
+            });
+            if !has_color {
+                continue;
+            }
+
+            let advance = glyphs.iter().map(|glyph| glyph.advance).sum::<f32>();
+            return Some(EmojiClusterMetrics {
+                font_index,
+                glyphs,
+                advance: advance.max(self.emoji_size(role)),
+            });
+        }
+        None
+    }
+
+    fn emoji_size(&self, role: TextRole) -> f32 {
+        self.size(role) * EMOJI_FONT_SCALE
+    }
+
+    fn draw_emoji_cluster(
+        &self,
+        canvas: &mut Canvas,
+        metrics: &EmojiClusterMetrics,
+        x: f32,
+        baseline: f32,
+        role: TextRole,
+    ) {
+        let size = self.emoji_size(role);
+        for glyph in &metrics.glyphs {
+            if let Some(image) =
+                self.color_glyph_image_with_size(metrics.font_index, glyph.id, size)
+            {
+                draw_color_glyph_image(canvas, x + glyph.x, baseline - glyph.y, &image);
+            }
+        }
+    }
+}
+
+fn is_color_emoji_candidate(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x1F000..=0x1FFFF | 0x2600..=0x27BF | 0x2300..=0x23FF
+    )
+}
+
+fn text_units(text: &str) -> TextUnitIter<'_> {
+    TextUnitIter { text, offset: 0 }
+}
+
+struct TextUnitIter<'a> {
+    text: &'a str,
+    offset: usize,
+}
+
+impl<'a> Iterator for TextUnitIter<'a> {
+    type Item = TextUnit<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.text.len() {
+            return None;
+        }
+
+        let start = self.offset;
+        let mut chars = self.text[start..].char_indices();
+        let (_, first) = chars.next()?;
+        let mut end = start + first.len_utf8();
+        let kind = if is_default_ignorable_for_display(first) {
+            TextUnitKind::Ignorable
+        } else if is_emoji_cluster_start(first) {
+            TextUnitKind::EmojiCluster
+        } else {
+            TextUnitKind::Character
+        };
+
+        if kind == TextUnitKind::EmojiCluster {
+            end = consume_emoji_cluster(self.text, end);
+        }
+
+        self.offset = end;
+        Some(TextUnit {
+            text: &self.text[start..end],
+            first,
+            start,
+            end,
+            kind,
+        })
+    }
+}
+
+fn consume_emoji_cluster(text: &str, mut offset: usize) -> usize {
+    offset = consume_emoji_suffix(text, offset);
+    loop {
+        let Some(joiner) = char_at(text, offset) else {
+            return offset;
+        };
+        if joiner != '\u{200d}' {
+            return offset;
+        }
+        let after_joiner = offset + joiner.len_utf8();
+        let Some(next) = char_at(text, after_joiner) else {
+            return offset;
+        };
+        if !is_emoji_cluster_start(next) {
+            return offset;
+        }
+        offset = consume_emoji_suffix(text, after_joiner + next.len_utf8());
+    }
+}
+
+fn consume_emoji_suffix(text: &str, mut offset: usize) -> usize {
+    while let Some(character) = char_at(text, offset) {
+        if is_emoji_modifier(character) || is_variation_selector(character) {
+            offset += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
+fn char_at(text: &str, offset: usize) -> Option<char> {
+    text.get(offset..)?.chars().next()
+}
+
+fn is_emoji_cluster_start(character: char) -> bool {
+    is_color_emoji_candidate(character) || matches!(character, '♂' | '♀')
+}
+
+fn is_emoji_modifier(character: char) -> bool {
+    matches!(character as u32, 0x1F3FB..=0x1F3FF)
+}
+
+fn is_variation_selector(character: char) -> bool {
+    matches!(character as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+}
+
+fn is_default_ignorable_for_display(character: char) -> bool {
+    matches!(character, '\u{200d}' | '\u{200c}') || is_variation_selector(character)
+}
+
+fn draw_color_glyph_image(
+    canvas: &mut Canvas,
+    x: f32,
+    baseline: f32,
+    image: &swash::scale::image::Image,
+) {
+    let left = x.floor() as i32 + image.placement.left;
+    let top = baseline.floor() as i32 - image.placement.top;
+    let width = image.placement.width as usize;
+    let height = image.placement.height as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    for row in 0..height {
+        for column in 0..width {
+            let index = (row * width + column) * 4;
+            if index + 3 >= image.data.len() {
+                return;
+            }
+            canvas.blend_rgba_pixel(
+                left + column as i32,
+                top + row as i32,
+                image.data[index],
+                image.data[index + 1],
+                image.data[index + 2],
+                image.data[index + 3],
+            );
+        }
+    }
+}
+
+fn draw_missing_glyph_box(
+    canvas: &mut Canvas,
+    x: f32,
+    baseline: f32,
+    advance: f32,
+    size: f32,
+    color: u32,
+) {
+    let left = x.round().max(0.0) as usize;
+    let top = (baseline - size * 0.85).round().max(0.0) as usize;
+    let width = advance.round().max(size * 0.5) as usize;
+    let height = (size * 0.85).round().max(1.0) as usize;
+    canvas.rect(left, top, width.max(1), height, color);
 }
 
 fn load_font_family(database: &Database, family: &str) -> Option<LoadedFont> {
@@ -2307,12 +3385,16 @@ fn load_font_family(database: &Database, family: &str) -> Option<LoadedFont> {
 fn load_font_id(database: &Database, id: fontdb::ID, index: u32, name: &str) -> Option<LoadedFont> {
     database
         .with_face_data(id, |data, _face_index| {
-            FontVec::try_from_vec_and_index(data.to_vec(), index)
+            let bytes = data.to_vec();
+            let font_data = Arc::from(bytes.clone().into_boxed_slice());
+            FontVec::try_from_vec_and_index(bytes, index)
                 .ok()
                 .map(FontArc::from)
                 .map(|font| LoadedFont {
                     name: name.to_owned(),
                     font,
+                    data: font_data,
+                    face_index: index as usize,
                 })
         })
         .flatten()
@@ -2367,6 +3449,17 @@ impl Canvas {
         }
     }
 
+    fn set_pixel(&mut self, x: i32, y: i32, color: u32) {
+        if x < 0 || y < 0 {
+            return;
+        }
+        let x = x as usize;
+        let y = y as usize;
+        if x < self.width && y < self.height {
+            self.pixels[y * self.width + x] = color;
+        }
+    }
+
     fn text(
         &mut self,
         x: usize,
@@ -2379,6 +3472,7 @@ impl Canvas {
         let baseline = y as f32
             + match role {
                 TextRole::Ui => 15.0,
+                TextRole::Find => 13.0,
                 TextRole::Editor => 19.0,
             };
         fonts.draw_text(self, x as f32, baseline, text, color, role);
@@ -2395,6 +3489,20 @@ impl Canvas {
         }
         let index = y * self.width + x;
         self.pixels[index] = blend(self.pixels[index], color, coverage.clamp(0.0, 1.0));
+    }
+
+    fn blend_rgba_pixel(&mut self, x: i32, y: i32, red: u8, green: u8, blue: u8, alpha: u8) {
+        if x < 0 || y < 0 || alpha == 0 {
+            return;
+        }
+        let x = x as usize;
+        let y = y as usize;
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let index = y * self.width + x;
+        let color = ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
+        self.pixels[index] = blend(self.pixels[index], color, alpha as f32 / 255.0);
     }
 }
 
@@ -2494,6 +3602,41 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_selection_updates_range_from_anchor() {
+        let mut gui_state = GuiState::new().expect("gui state");
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("abcdef").expect("insert");
+        gui_state.selection_anchor = Some(1);
+        gui_state.selection_focus = Some(1);
+        gui_state.mouse_selecting = true;
+
+        let x = TEXT_MARGIN_X + gui_state.fonts.measure_text("abc", TextRole::Editor) as usize;
+        update_mouse_selection(
+            &mut app,
+            &mut gui_state,
+            640,
+            400,
+            x,
+            text_top() + TEXT_MARGIN_Y,
+        )
+        .expect("drag selection");
+
+        assert_eq!(app.selected_range(), Some(1..3));
+        assert_eq!(gui_state.selection_focus, Some(3));
+
+        update_mouse_selection(
+            &mut app,
+            &mut gui_state,
+            640,
+            400,
+            x,
+            text_top() + TEXT_MARGIN_Y,
+        )
+        .expect("redundant drag selection");
+        assert_eq!(app.selected_range(), Some(1..3));
+    }
+
+    #[test]
     fn scrollbar_clicks_move_viewport() {
         let mut app = BlitzApp::new(EditorSettings::default());
         let mut gui_state = GuiState::new().expect("gui state");
@@ -2581,6 +3724,101 @@ mod tests {
     }
 
     #[test]
+    fn text_input_decodes_surrogate_pair_emoji() {
+        let queue = Rc::new(RefCell::new(Vec::new()));
+        let mut input = TextInput::new(Rc::clone(&queue));
+
+        input.add_char(0xD83D);
+        input.add_char(0xDE00);
+
+        assert_eq!(*queue.borrow(), vec!['😀']);
+    }
+
+    #[test]
+    fn text_input_repairs_legacy_pua_emoji_code_unit() {
+        let queue = Rc::new(RefCell::new(Vec::new()));
+        let mut input = TextInput::new(Rc::clone(&queue));
+
+        input.add_char(0xF610);
+
+        assert_eq!(*queue.borrow(), vec!['😐']);
+    }
+
+    #[test]
+    fn text_units_keep_emoji_zwj_sequence_together() {
+        let units = text_units("🙆‍♂️a").collect::<Vec<_>>();
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].text, "🙆‍♂️");
+        assert_eq!(units[0].kind, TextUnitKind::EmojiCluster);
+        assert_eq!(units[1].text, "a");
+    }
+
+    #[test]
+    fn font_stack_can_select_emoji_fallback_when_available() {
+        let fonts = FontStack::load().expect("fonts");
+        let has_emoji_family = fonts.fonts.iter().any(|font| {
+            font.name.contains("Emoji")
+                || font.name.contains("Symbol")
+                || font.name.contains("Segoe Fluent")
+        });
+        if !has_emoji_family {
+            return;
+        }
+
+        let grinning = fonts.emoji_cluster_metrics("😀", TextRole::Editor);
+        let neutral = fonts.emoji_cluster_metrics("😐", TextRole::Editor);
+
+        assert!(grinning.is_some());
+        assert!(neutral.is_some());
+    }
+
+    #[test]
+    fn emoji_cluster_width_is_close_to_text_height() {
+        let fonts = FontStack::load().expect("fonts");
+        let Some(metrics) = fonts.emoji_cluster_metrics("🙆‍♂️", TextRole::Editor) else {
+            return;
+        };
+
+        assert!(metrics.advance <= EDITOR_FONT_SIZE);
+        assert!(metrics.advance >= EDITOR_FONT_SIZE * 0.5);
+    }
+
+    #[test]
+    fn emoji_rendering_produces_color_pixels_when_color_font_is_available() {
+        let fonts = FontStack::load().expect("fonts");
+        if fonts
+            .emoji_cluster_metrics("😀", TextRole::Editor)
+            .is_none()
+        {
+            return;
+        }
+
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("😀").expect("insert emoji");
+        let frame = render_frame(&app, 240, 140).expect("render");
+
+        assert!(frame.pixels.iter().any(|pixel| is_colorful_pixel(*pixel)));
+    }
+
+    #[test]
+    fn emoji_zwj_sequence_rendering_produces_color_pixels_when_supported() {
+        let fonts = FontStack::load().expect("fonts");
+        if fonts
+            .emoji_cluster_metrics("🙆‍♂️", TextRole::Editor)
+            .is_none()
+        {
+            return;
+        }
+
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("🙆‍♂️").expect("insert emoji sequence");
+        let frame = render_frame(&app, 240, 140).expect("render");
+
+        assert!(frame.pixels.iter().any(|pixel| is_colorful_pixel(*pixel)));
+    }
+
+    #[test]
     fn font_stack_reuses_glyph_metrics() {
         let fonts = FontStack::load().expect("fonts");
 
@@ -2644,6 +3882,79 @@ mod tests {
             COLOR_STATUS
         );
         assert!(frame.pixels.iter().any(|pixel| *pixel == COLOR_CARET));
+    }
+
+    #[test]
+    fn selected_text_is_highlighted_in_editor() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("abcdef").expect("insert");
+        app.set_selection_range(1, 4).expect("selection");
+
+        let frame = render_frame(&app, 640, 400).expect("render");
+
+        assert!(frame.pixels.iter().any(|pixel| *pixel == COLOR_SELECTION));
+    }
+
+    #[test]
+    fn find_window_view_draws_notepad_style_controls() {
+        let fonts = FontStack::load().expect("fonts");
+        let view = FindWindowView {
+            query: "test".to_owned(),
+            match_case: false,
+            wrap_around: false,
+            forward: true,
+        };
+
+        let frame = render_find_window_view(&view, &fonts);
+
+        assert_eq!(frame.width, FIND_WINDOW_WIDTH);
+        assert_eq!(frame.height, FIND_WINDOW_HEIGHT);
+        assert!(fonts.measure("Find Next", TextRole::Find) <= FIND_NEXT_BUTTON_RECT.width - 8);
+        assert!(
+            FIND_DOWN_RADIO_RECT.x + FIND_DOWN_RADIO_RECT.width
+                <= FIND_DIRECTION_GROUP_RECT.x + FIND_DIRECTION_GROUP_RECT.width
+        );
+        assert!(FIND_UP_RADIO_RECT.x >= FIND_DIRECTION_GROUP_RECT.x);
+        assert_eq!(
+            frame.pixels[pixel_index(&frame, FIND_FIELD_RECT.x, FIND_FIELD_RECT.y)],
+            0x000078d7
+        );
+        assert_eq!(
+            frame.pixels[pixel_index(
+                &frame,
+                FIND_NEXT_BUTTON_RECT.x + 2,
+                FIND_NEXT_BUTTON_RECT.y + 2
+            )],
+            COLOR_BUTTON
+        );
+        assert_eq!(
+            frame.pixels[pixel_index(
+                &frame,
+                FIND_MATCH_CASE_RECT.x + 8,
+                FIND_MATCH_CASE_RECT.y + 11
+            )],
+            COLOR_TEXT_AREA
+        );
+    }
+
+    #[test]
+    fn selection_highlight_is_clipped_before_vertical_scrollbar() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text(&"x".repeat(512)).expect("insert");
+        app.select_all();
+
+        let frame = render_frame(&app, 640, 400).expect("render");
+        let metrics = editor_metrics(&app.ui_state().expect("ui"), 640, 400).expect("metrics");
+        let y = text_top() + TEXT_MARGIN_Y + 4;
+
+        assert_eq!(
+            frame.pixels[pixel_index(&frame, metrics.text_width + 1, y)],
+            COLOR_SCROLLBAR
+        );
+        assert_ne!(
+            frame.pixels[pixel_index(&frame, metrics.text_width + 1, y)],
+            COLOR_SELECTION
+        );
     }
 
     #[test]
@@ -2742,6 +4053,7 @@ mod tests {
         gui_state.last_search = Some(SearchSpec {
             query: "one".to_owned(),
             match_case: true,
+            wrap_around: true,
         });
 
         find_again(&mut app, &mut gui_state, true).expect("find");
@@ -2768,5 +4080,12 @@ mod tests {
 
     fn pixel_index(frame: &RenderFrame, x: usize, y: usize) -> usize {
         y * frame.width + x
+    }
+
+    fn is_colorful_pixel(pixel: u32) -> bool {
+        let red = (pixel >> 16) & 0xff;
+        let green = (pixel >> 8) & 0xff;
+        let blue = pixel & 0xff;
+        red.abs_diff(green) > 24 || red.abs_diff(blue) > 24 || green.abs_diff(blue) > 24
     }
 }

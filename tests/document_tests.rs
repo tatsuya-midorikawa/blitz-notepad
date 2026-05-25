@@ -37,6 +37,22 @@ fn japanese_input_round_trips_as_utf8() {
 }
 
 #[test]
+fn emoji_input_round_trips_as_utf8() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("emoji.txt");
+    let mut document = Document::new_untitled();
+
+    document.insert_text(0, "😐😀").expect("insert emoji");
+    document
+        .save_as(&path, TextEncoding::Utf8, LineEnding::Lf)
+        .expect("save");
+
+    let reopened = Document::open(&path).expect("open");
+    assert_eq!(reopened.text_lossy(), "😐😀");
+    assert_eq!(reopened.encoding(), TextEncoding::Utf8);
+}
+
+#[test]
 fn detects_utf16_and_ansi_samples() {
     let mut utf16 = vec![0xFF, 0xFE];
     for code_unit in "日本語".encode_utf16() {

@@ -116,6 +116,14 @@ impl BlitzApp {
         Ok(())
     }
 
+    pub fn set_selection_range(&mut self, anchor: usize, focus: usize) -> Result<()> {
+        self.document.caret_position(anchor)?;
+        self.document.caret_position(focus)?;
+        self.caret_offset = focus;
+        self.selection = normalized_selection(anchor, focus);
+        Ok(())
+    }
+
     pub fn selected_range(&self) -> Option<Range<usize>> {
         self.selection.clone()
     }
@@ -157,12 +165,23 @@ impl BlitzApp {
     }
 
     pub fn find_text(&mut self, query: &str, match_case: bool, forward: bool) -> Result<bool> {
+        self.find_text_with_options(query, match_case, forward, true)
+    }
+
+    pub fn find_text_with_options(
+        &mut self,
+        query: &str,
+        match_case: bool,
+        forward: bool,
+        wrap_around: bool,
+    ) -> Result<bool> {
         let Some(range) = find_range(
             &self.document.text_lossy(),
             query,
             self.caret_offset,
             match_case,
             forward,
+            wrap_around,
         ) else {
             return Ok(false);
         };
@@ -416,6 +435,7 @@ fn find_range(
     caret_offset: usize,
     match_case: bool,
     forward: bool,
+    wrap_around: bool,
 ) -> Option<Range<usize>> {
     if query.is_empty() {
         return None;
@@ -423,18 +443,19 @@ fn find_range(
 
     let ranges = find_all_ranges(text, query, match_case);
     if forward {
-        ranges
-            .iter()
-            .find(|range| range.start >= caret_offset)
-            .or_else(|| ranges.first())
-            .cloned()
+        let found = ranges.iter().find(|range| range.start >= caret_offset);
+        if wrap_around {
+            found.or_else(|| ranges.first()).cloned()
+        } else {
+            found.cloned()
+        }
     } else {
-        ranges
-            .iter()
-            .rev()
-            .find(|range| range.start < caret_offset)
-            .or_else(|| ranges.last())
-            .cloned()
+        let found = ranges.iter().rev().find(|range| range.start < caret_offset);
+        if wrap_around {
+            found.or_else(|| ranges.last()).cloned()
+        } else {
+            found.cloned()
+        }
     }
 }
 
@@ -462,6 +483,14 @@ fn text_matches(text: &str, query: &str, match_case: bool) -> bool {
         text == query
     } else {
         text.eq_ignore_ascii_case(query)
+    }
+}
+
+fn normalized_selection(anchor: usize, focus: usize) -> Option<Range<usize>> {
+    match anchor.cmp(&focus) {
+        std::cmp::Ordering::Less => Some(anchor..focus),
+        std::cmp::Ordering::Greater => Some(focus..anchor),
+        std::cmp::Ordering::Equal => None,
     }
 }
 
@@ -547,6 +576,18 @@ mod tests {
     }
 
     #[test]
+    fn selection_range_normalizes_anchor_and_focus() {
+        let mut app = BlitzApp::default();
+        app.insert_text("abcdef").expect("insert");
+
+        app.set_selection_range(5, 2).expect("selection");
+
+        assert_eq!(app.selected_range(), Some(2..5));
+        assert_eq!(app.caret_offset(), 2);
+        assert_eq!(app.selected_text().as_deref(), Some("cde"));
+    }
+
+    #[test]
     fn find_replace_and_go_to_work() {
         let mut app = BlitzApp::default();
         app.insert_text("alpha\nbeta\nALPHA").expect("insert");
@@ -572,6 +613,21 @@ mod tests {
                 .line,
             2
         );
+    }
+
+    #[test]
+    fn find_text_can_disable_wrap_around() {
+        let mut app = BlitzApp::default();
+        app.insert_text("one two one").expect("insert");
+        app.set_caret_offset("one two one".len()).expect("caret");
+
+        assert!(!app
+            .find_text_with_options("one", true, true, false)
+            .expect("find without wrap"));
+        assert!(app
+            .find_text_with_options("one", true, true, true)
+            .expect("find with wrap"));
+        assert_eq!(app.selected_range(), Some(0..3));
     }
 
     #[test]

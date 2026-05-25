@@ -51,6 +51,16 @@ fn app_ui_handles_japanese_input_without_mojibake() {
 }
 
 #[test]
+fn app_ui_handles_emoji_input_without_mojibake() {
+    let mut app = BlitzApp::default();
+    app.insert_text("😐😀").expect("insert emoji");
+    let state = app.ui_state().expect("ui state");
+
+    assert_eq!(app.document().text_lossy(), "😐😀");
+    assert_eq!(state.status_cells()[0], "Ln 1, Col 3");
+}
+
+#[test]
 fn ui_render_handles_sparse_500mb_file() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("huge-ui.txt");
