@@ -6,6 +6,8 @@ use memmap2::Mmap;
 
 use crate::{BlitzError, Result};
 
+const STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub enum SourceBytes {
     Heap(Arc<[u8]>),
@@ -138,8 +140,59 @@ impl PieceTable {
         mut visit: impl FnMut(&[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         for piece in &self.pieces {
-            visit(self.piece_bytes(piece))?;
+            for chunk in self.piece_bytes(piece).chunks(STREAM_CHUNK_BYTES) {
+                visit(chunk)?;
+            }
         }
+        Ok(())
+    }
+
+    pub fn for_each_chunk_rev<E>(
+        &self,
+        mut visit: impl FnMut(usize, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut piece_end = self.len;
+        for piece in self.pieces.iter().rev() {
+            let piece_start = piece_end - piece.len;
+            let bytes = self.piece_bytes(piece);
+            let mut chunk_end = bytes.len();
+            while chunk_end > 0 {
+                let chunk_start = chunk_end.saturating_sub(STREAM_CHUNK_BYTES);
+                visit(piece_start + chunk_start, &bytes[chunk_start..chunk_end])?;
+                chunk_end = chunk_start;
+            }
+            piece_end = piece_start;
+        }
+        Ok(())
+    }
+
+    pub fn for_each_chunk_range(
+        &self,
+        range: Range<usize>,
+        mut visit: impl FnMut(usize, &[u8]),
+    ) -> Result<()> {
+        self.ensure_range_bounds(&range)?;
+        let mut cursor = 0usize;
+
+        for piece in &self.pieces {
+            let piece_start = cursor;
+            let piece_end = cursor + piece.len;
+            cursor = piece_end;
+
+            if piece_end <= range.start || piece_start >= range.end {
+                continue;
+            }
+
+            let overlap_start = range.start.max(piece_start);
+            let overlap_end = range.end.min(piece_end);
+            let local_start = overlap_start - piece_start;
+            let local_end = overlap_end - piece_start;
+            let bytes = &self.piece_bytes(piece)[local_start..local_end];
+            for (chunk_index, chunk) in bytes.chunks(STREAM_CHUNK_BYTES).enumerate() {
+                visit(overlap_start + chunk_index * STREAM_CHUNK_BYTES, chunk);
+            }
+        }
+
         Ok(())
     }
 

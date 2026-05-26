@@ -50,6 +50,7 @@ const EMOJI_FONT_SCALE: f32 = 0.68;
 const WHEEL_LINES: isize = 3;
 const HORIZONTAL_WHEEL_BYTES: isize = 96;
 const MIN_SCROLL_THUMB: usize = 32;
+const REVEAL_LINE_INDEX_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 const COLOR_WINDOW: u32 = 0x00f0f0f0;
 const COLOR_TEXT_AREA: u32 = 0x00ffffff;
@@ -189,6 +190,7 @@ struct GuiState {
     first_visible_line: usize,
     horizontal_offset: usize,
     last_caret_offset: usize,
+    pending_reveal_selection: bool,
     scroll_drag: Option<ScrollDrag>,
     selection_anchor: Option<usize>,
     selection_focus: Option<usize>,
@@ -210,6 +212,7 @@ impl GuiState {
             first_visible_line: 0,
             horizontal_offset: 0,
             last_caret_offset: 0,
+            pending_reveal_selection: false,
             scroll_drag: None,
             selection_anchor: None,
             selection_focus: None,
@@ -225,6 +228,7 @@ impl GuiState {
         self.first_visible_line = 0;
         self.horizontal_offset = 0;
         self.last_caret_offset = app.caret_offset();
+        self.pending_reveal_selection = false;
         self.selection_anchor = None;
         self.selection_focus = None;
         self.mouse_selecting = false;
@@ -251,11 +255,19 @@ impl GuiState {
     }
 
     fn follow_caret_if_moved(&mut self, app: &BlitzApp, width: usize, height: usize) -> Result<()> {
-        if self.last_caret_offset == app.caret_offset() {
+        if self.last_caret_offset == app.caret_offset() && !self.pending_reveal_selection {
             return Ok(());
         }
 
         if let Some(metrics) = editor_metrics_for_app(app, width, height) {
+            if self.pending_reveal_selection {
+                if self.reveal_selection(app, metrics)? {
+                    self.pending_reveal_selection = false;
+                    self.last_caret_offset = app.caret_offset();
+                }
+                return Ok(());
+            }
+
             let caret_line = app.document().line_for_offset(app.caret_offset())?;
             if caret_line < self.first_visible_line {
                 self.first_visible_line = caret_line;
@@ -283,6 +295,50 @@ impl GuiState {
         }
 
         self.last_caret_offset = app.caret_offset();
+        Ok(())
+    }
+
+    fn reveal_selection(&mut self, app: &BlitzApp, metrics: EditorMetrics) -> Result<bool> {
+        let Some(selection) = app.selected_range() else {
+            return Ok(true);
+        };
+
+        let reveal_offset = selection.end.min(app.document().len());
+        if !app.document().line_index_covers_offset(reveal_offset)
+            && !app
+                .document()
+                .extend_line_index_towards_offset(reveal_offset, REVEAL_LINE_INDEX_BUDGET_BYTES)?
+        {
+            return Ok(false);
+        }
+
+        let selection_line = app.document().line_for_offset(selection.start)?;
+        self.first_visible_line = selection_line
+            .saturating_sub(metrics.visible_line_count / 2)
+            .min(max_first_visible_line(app, metrics.visible_line_count));
+        self.center_horizontal_range(app, metrics, selection)?;
+        self.clamp_horizontal(app, metrics.visible_line_count);
+        Ok(true)
+    }
+
+    fn center_horizontal_range(
+        &mut self,
+        app: &BlitzApp,
+        metrics: EditorMetrics,
+        selection: std::ops::Range<usize>,
+    ) -> Result<()> {
+        let content_range = app
+            .document()
+            .line_content_range_for_offset(selection.start)?;
+        let selection_start = selection
+            .start
+            .clamp(content_range.start, content_range.end);
+        let selection_end = selection.end.min(content_range.end).max(selection_start);
+        let relative_start = selection_start.saturating_sub(content_range.start);
+        let relative_end = selection_end.saturating_sub(content_range.start);
+        let visible_bytes = visible_byte_capacity(&self.fonts, metrics.editor_text_width);
+        self.horizontal_offset =
+            centered_offset_for_range(relative_start, relative_end, visible_bytes);
         Ok(())
     }
 }
@@ -812,10 +868,21 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
 
     let mut keep_open = find_window.window.is_open();
     if keep_open {
-        keep_open = handle_find_window_keys(app, &mut gui_state.last_search, &mut find_window);
+        keep_open = handle_find_window_keys(
+            app,
+            &mut gui_state.last_search,
+            &mut gui_state.pending_reveal_selection,
+            &mut gui_state.clipboard,
+            &mut find_window,
+        );
     }
     if keep_open {
-        keep_open = handle_find_window_mouse(app, &mut gui_state.last_search, &mut find_window);
+        keep_open = handle_find_window_mouse(
+            app,
+            &mut gui_state.last_search,
+            &mut gui_state.pending_reveal_selection,
+            &mut find_window,
+        );
     }
     if keep_open {
         let frame = render_find_window(&find_window, &gui_state.fonts);
@@ -832,6 +899,8 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
 fn handle_find_window_keys(
     app: &mut BlitzApp,
     last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
+    clipboard: &mut String,
     find_window: &mut FindWindowState,
 ) -> bool {
     if find_window
@@ -845,7 +914,7 @@ fn handle_find_window_keys(
             .window
             .is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
     {
-        run_find_from_window(app, last_search, find_window);
+        run_find_from_window(app, last_search, pending_reveal_selection, find_window);
     }
     if find_window
         .window
@@ -858,6 +927,13 @@ fn handle_find_window_keys(
     }
     if find_window.window.is_key_pressed(Key::Down, KeyRepeat::No) {
         find_window.forward = true;
+    }
+    if is_command_down(&find_window.window)
+        && find_window.window.is_key_pressed(Key::V, KeyRepeat::No)
+    {
+        paste_into_find_query(&mut find_window.query, clipboard);
+        find_window.input_queue.borrow_mut().clear();
+        return true;
     }
 
     let characters = find_window
@@ -955,6 +1031,7 @@ fn ascii_find_char_for_key(key: Key, shift: bool) -> Option<char> {
 fn handle_find_window_mouse(
     app: &mut BlitzApp,
     last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
     find_window: &mut FindWindowState,
 ) -> bool {
     let mouse_down = find_window.window.get_mouse_down(MouseButton::Left);
@@ -972,7 +1049,7 @@ fn handle_find_window_mouse(
 
     if hit_rect(x, y, FIND_NEXT_BUTTON_RECT) {
         if !find_window.query.is_empty() {
-            run_find_from_window(app, last_search, find_window);
+            run_find_from_window(app, last_search, pending_reveal_selection, find_window);
         }
     } else if hit_rect(x, y, FIND_CANCEL_BUTTON_RECT) {
         return false;
@@ -992,6 +1069,7 @@ fn handle_find_window_mouse(
 fn run_find_from_window(
     app: &mut BlitzApp,
     last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
     find_window: &FindWindowState,
 ) {
     if find_window.query.is_empty() {
@@ -1007,6 +1085,7 @@ fn run_find_from_window(
         )
         .unwrap_or(false)
     {
+        *pending_reveal_selection = true;
         *last_search = Some(SearchSpec {
             query: find_window.query.clone(),
             match_case: find_window.match_case,
@@ -1749,6 +1828,7 @@ fn find_again(app: &mut BlitzApp, gui_state: &mut GuiState, forward: bool) -> Re
         forward,
         search.wrap_around,
     )? {
+        gui_state.pending_reveal_selection = true;
         gui_state.set_message("Found");
     } else {
         gui_state.set_message("Cannot find text");
@@ -1918,12 +1998,28 @@ fn set_clipboard_text(gui_state: &mut GuiState, text: String) {
     gui_state.clipboard = text;
 }
 
-fn paste_from_clipboard(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
-    let clipboard_text = Clipboard::new()
+fn clipboard_text(clipboard_cache: &str) -> String {
+    Clipboard::new()
         .ok()
         .and_then(|mut clipboard| clipboard.get_text().ok())
         .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| gui_state.clipboard.clone());
+        .unwrap_or_else(|| clipboard_cache.to_owned())
+}
+
+fn paste_into_find_query(query: &mut String, clipboard_cache: &mut String) {
+    let pasted = clipboard_text(clipboard_cache);
+    append_find_query_paste(query, clipboard_cache, pasted);
+}
+
+fn append_find_query_paste(query: &mut String, clipboard_cache: &mut String, pasted: String) {
+    if !pasted.is_empty() {
+        query.push_str(&pasted);
+        *clipboard_cache = pasted;
+    }
+}
+
+fn paste_from_clipboard(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    let clipboard_text = clipboard_text(&gui_state.clipboard);
 
     if !clipboard_text.is_empty() {
         app.paste_text(&clipboard_text)?;
@@ -2367,6 +2463,21 @@ fn max_visible_line_len(app: &BlitzApp, first_line: usize, visible_lines: usize)
 fn visible_byte_capacity(fonts: &FontStack, editor_text_width: usize) -> usize {
     let average_char_width = fonts.measure("m", TextRole::Editor).max(1);
     editor_text_width.saturating_div(average_char_width).max(1)
+}
+
+fn centered_offset_for_range(range_start: usize, range_end: usize, visible_len: usize) -> usize {
+    let visible_len = visible_len.max(1);
+    let range_len = range_end.saturating_sub(range_start);
+    if range_len >= visible_len {
+        return range_start;
+    }
+
+    let midpoint = range_start + range_len / 2;
+    let centered = midpoint.saturating_sub(visible_len / 2);
+    let latest_offset_that_keeps_end_visible = range_end.saturating_sub(visible_len);
+    centered
+        .max(latest_offset_that_keeps_end_visible)
+        .min(range_start)
 }
 
 fn offset_with_delta(offset: usize, delta: isize) -> usize {
@@ -4070,6 +4181,17 @@ mod tests {
     }
 
     #[test]
+    fn find_textbox_paste_appends_clipboard_text() {
+        let mut query = "prefix ".to_owned();
+        let mut clipboard_cache = String::new();
+
+        append_find_query_paste(&mut query, &mut clipboard_cache, "日本語 search".to_owned());
+
+        assert_eq!(query, "prefix 日本語 search");
+        assert_eq!(clipboard_cache, "日本語 search");
+    }
+
+    #[test]
     fn selection_highlight_is_clipped_before_vertical_scrollbar() {
         let mut app = BlitzApp::new(EditorSettings::default());
         app.insert_text(&"x".repeat(512)).expect("insert");
@@ -4192,6 +4314,69 @@ mod tests {
         assert_eq!(app.selected_range(), Some(0..3));
         find_again(&mut app, &mut gui_state, true).expect("find");
         assert_eq!(app.selected_range(), Some(8..11));
+    }
+
+    #[test]
+    fn find_next_reveals_match_horizontally() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        let prefix = "a".repeat(200);
+        app.insert_text(&format!("{prefix}needle")).expect("insert");
+        gui_state.last_search = Some(SearchSpec {
+            query: "needle".to_owned(),
+            match_case: true,
+            wrap_around: true,
+        });
+
+        find_again(&mut app, &mut gui_state, true).expect("find");
+        gui_state
+            .follow_caret_if_moved(&app, 640, 400)
+            .expect("reveal");
+
+        let selection = app.selected_range().expect("selection");
+        let metrics = editor_metrics(&app.ui_state().expect("ui"), 640, 400).expect("metrics");
+        let content_range = app
+            .document()
+            .line_content_range_for_offset(selection.start)
+            .expect("line range");
+        let visible_bytes = visible_byte_capacity(&gui_state.fonts, metrics.editor_text_width);
+        let relative_start = selection.start - content_range.start;
+        let relative_end = selection.end - content_range.start;
+
+        assert!(gui_state.horizontal_offset > 0);
+        assert_eq!(
+            gui_state.horizontal_offset,
+            centered_offset_for_range(relative_start, relative_end, visible_bytes)
+        );
+        assert!(gui_state.horizontal_offset <= relative_start);
+        assert!(relative_end <= gui_state.horizontal_offset + visible_bytes);
+    }
+
+    #[test]
+    fn find_previous_reveals_match_when_caret_offset_does_not_change() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        let prefix = "a".repeat(200);
+        let text = format!("{prefix}needle");
+        app.insert_text(&text).expect("insert");
+        app.set_caret_offset(text.len()).expect("caret");
+        gui_state.last_caret_offset = app.caret_offset();
+        gui_state.last_search = Some(SearchSpec {
+            query: "needle".to_owned(),
+            match_case: true,
+            wrap_around: false,
+        });
+
+        find_again(&mut app, &mut gui_state, false).expect("find previous");
+        assert_eq!(app.caret_offset(), text.len());
+        assert!(gui_state.pending_reveal_selection);
+
+        gui_state
+            .follow_caret_if_moved(&app, 640, 400)
+            .expect("reveal");
+
+        assert!(!gui_state.pending_reveal_selection);
+        assert!(gui_state.horizontal_offset > 0);
     }
 
     #[test]

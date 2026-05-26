@@ -210,6 +210,20 @@ impl Document {
         self.buffer.collect_bytes()
     }
 
+    pub(crate) fn for_each_chunk<E>(
+        &self,
+        visit: impl FnMut(&[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.buffer.for_each_chunk(visit)
+    }
+
+    pub(crate) fn for_each_chunk_rev<E>(
+        &self,
+        visit: impl FnMut(usize, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.buffer.for_each_chunk_rev(visit)
+    }
+
     pub fn insert_text(&mut self, byte_offset: usize, text: &str) -> Result<()> {
         self.ensure_char_boundary(byte_offset)?;
         if text.is_empty() {
@@ -559,7 +573,7 @@ impl Document {
         self.update_line_index_after_replace(&previous_buffer, range, text)
     }
 
-    fn ensure_line_index_covers_offset(&mut self, byte_offset: usize) -> Result<()> {
+    pub(crate) fn ensure_line_index_covers_offset(&self, byte_offset: usize) -> Result<()> {
         self.refresh_line_index();
         loop {
             let (indexed_len, complete) = {
@@ -577,11 +591,64 @@ impl Document {
                 return Ok(());
             }
 
-            let chunk = self.buffer.bytes_range(indexed_len..next_len)?;
-            self.line_index
-                .get_mut()
-                .extend_from_chunk(&chunk, self.buffer.len());
+            self.extend_line_index_range(indexed_len..next_len)?;
         }
+    }
+
+    pub(crate) fn line_index_covers_offset(&self, byte_offset: usize) -> bool {
+        self.refresh_line_index();
+        let line_index = self.line_index.borrow();
+        line_index.is_complete() || byte_offset <= line_index.indexed_len()
+    }
+
+    pub(crate) fn extend_line_index_towards_offset(
+        &self,
+        byte_offset: usize,
+        max_bytes: usize,
+    ) -> Result<bool> {
+        self.refresh_line_index();
+        let (indexed_len, complete) = {
+            let line_index = self.line_index.borrow();
+            (line_index.indexed_len(), line_index.is_complete())
+        };
+        if complete || byte_offset <= indexed_len {
+            return Ok(true);
+        }
+
+        let next_len = indexed_len
+            .saturating_add(max_bytes.max(1))
+            .min(byte_offset)
+            .min(self.buffer.len());
+        if next_len > indexed_len {
+            self.extend_line_index_range(indexed_len..next_len)?;
+        }
+
+        Ok(self.line_index_covers_offset(byte_offset))
+    }
+
+    fn extend_line_index_range(&self, range: Range<usize>) -> Result<()> {
+        let document_len = self.buffer.len();
+        let mut line_index = self.line_index.borrow_mut();
+        self.buffer
+            .for_each_chunk_range(range, |chunk_start, chunk| {
+                let indexed_len = line_index.indexed_len();
+                let consumed_from_chunk = if indexed_len < chunk_start && !chunk.is_empty() {
+                    let bridge_start = indexed_len;
+                    let bridge_end = chunk_start + 1;
+                    if bridge_start < bridge_end {
+                        if let Ok(bridge) = self.buffer.bytes_range(bridge_start..bridge_end) {
+                            line_index.extend_from_chunk(&bridge, document_len);
+                        }
+                    }
+                    line_index.indexed_len().saturating_sub(chunk_start)
+                } else {
+                    indexed_len.saturating_sub(chunk_start)
+                };
+
+                if consumed_from_chunk < chunk.len() {
+                    line_index.extend_from_chunk(&chunk[consumed_from_chunk..], document_len);
+                }
+            })
     }
 
     fn update_line_index_after_replace(
@@ -1041,5 +1108,36 @@ mod tests {
 
         assert_eq!(document.line_count(), 5);
         assert_eq!(document.visible_lines(4, 1)[0].text, "e");
+    }
+
+    #[test]
+    fn incremental_line_index_preserves_crlf_across_stream_chunk_boundary() {
+        let chunk_len = 1024 * 1024;
+        let mut bytes = vec![b'a'; chunk_len - 1];
+        bytes.extend_from_slice(b"\r\nb");
+        let len = bytes.len();
+        let source = SourceBytes::from_vec(bytes.clone());
+        let buffer = PieceTable::from_source(source, 0, len).expect("piece table");
+        let document = Document {
+            path: None,
+            buffer,
+            line_index: RefCell::new(LineIndex::build_prefix(&bytes, 0)),
+            pending_line_index: RefCell::new(None),
+            encoding: TextEncoding::Utf8,
+            line_ending: LineEnding::CrLf,
+            dirty: false,
+            load_mode: LoadMode::Heap,
+            original_file_len: len as u64,
+            change_generation: 0,
+            saved_generation: Some(0),
+            undo_stack: Vec::new(),
+        };
+
+        assert!(document
+            .extend_line_index_towards_offset(len, len)
+            .expect("extend"));
+
+        assert_eq!(document.line_start(1), Some(chunk_len + 1));
+        assert_eq!(document.visible_lines(1, 1)[0].text, "b");
     }
 }
