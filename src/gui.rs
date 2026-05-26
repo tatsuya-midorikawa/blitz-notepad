@@ -31,7 +31,7 @@ use crate::{BlitzApp, BlitzError, Result};
 const DEFAULT_WIDTH: usize = 960;
 const DEFAULT_HEIGHT: usize = 640;
 const FIND_WINDOW_WIDTH: usize = 430;
-const FIND_WINDOW_HEIGHT: usize = 150;
+const FIND_WINDOW_HEIGHT: usize = 140;
 const MIN_WIDTH: usize = 420;
 const MIN_HEIGHT: usize = 240;
 const MENU_HEIGHT: usize = 30;
@@ -341,50 +341,50 @@ struct Rect {
 
 const FIND_FIELD_RECT: Rect = Rect {
     x: 118,
-    y: 34,
+    y: 20,
     width: 205,
     height: 24,
 };
 const FIND_NEXT_BUTTON_RECT: Rect = Rect {
     x: 333,
-    y: 30,
+    y: 20,
     width: 82,
-    height: 26,
+    height: 24,
 };
 const FIND_CANCEL_BUTTON_RECT: Rect = Rect {
     x: 333,
-    y: 64,
+    y: 52,
     width: 82,
-    height: 26,
+    height: 24,
 };
 const FIND_MATCH_CASE_RECT: Rect = Rect {
     x: 16,
-    y: 92,
+    y: 82,
     width: 130,
     height: 22,
 };
 const FIND_WRAP_RECT: Rect = Rect {
     x: 16,
-    y: 120,
+    y: 110,
     width: 140,
     height: 22,
 };
 const FIND_UP_RADIO_RECT: Rect = Rect {
-    x: 248,
-    y: 104,
-    width: 46,
+    x: 192,
+    y: 100,
+    width: 48,
     height: 20,
 };
 const FIND_DOWN_RADIO_RECT: Rect = Rect {
-    x: 272,
-    y: 104,
-    width: 58,
+    x: 244,
+    y: 100,
+    width: 62,
     height: 20,
 };
 const FIND_DIRECTION_GROUP_RECT: Rect = Rect {
-    x: 220,
-    y: 82,
-    width: 110,
+    x: 172,
+    y: 80,
+    width: 140,
     height: 50,
 };
 
@@ -756,7 +756,7 @@ fn open_find_window(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
     }
 
     let input_queue = Rc::new(RefCell::new(Vec::new()));
-    let mut window = Window::new(
+    let window = Window::new(
         "Find",
         FIND_WINDOW_WIDTH,
         FIND_WINDOW_HEIGHT,
@@ -766,7 +766,6 @@ fn open_find_window(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
         },
     )
     .map_err(|error| BlitzError::Window(error.to_string()))?;
-    window.set_input_callback(Box::new(TextInput::new(Rc::clone(&input_queue))));
 
     let query = app
         .selected_text()
@@ -785,27 +784,38 @@ fn open_find_window(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
 
     gui_state.find_window = Some(FindWindowState {
         window,
-        input_queue,
+        input_queue: Rc::clone(&input_queue),
         query,
         match_case,
         wrap_around,
         forward: true,
         mouse_was_down: false,
     });
+    if let Some(find_window) = gui_state.find_window.as_mut() {
+        find_window
+            .window
+            .set_input_callback(Box::new(TextInput::new(input_queue)));
+    }
     Ok(())
 }
 
 fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
-    let Some(mut find_window) = gui_state.find_window.take() else {
+    let Some(mut find_window) = gui_state.find_window.as_mut() else {
         return Ok(());
     };
 
+    let frame = render_find_window(&find_window, &gui_state.fonts);
+    find_window
+        .window
+        .update_with_buffer(&frame.pixels, frame.width, frame.height)
+        .map_err(|error| BlitzError::Window(error.to_string()))?;
+
     let mut keep_open = find_window.window.is_open();
     if keep_open {
-        keep_open = handle_find_window_keys(app, gui_state, &mut find_window);
+        keep_open = handle_find_window_keys(app, &mut gui_state.last_search, &mut find_window);
     }
     if keep_open {
-        keep_open = handle_find_window_mouse(app, gui_state, &mut find_window);
+        keep_open = handle_find_window_mouse(app, &mut gui_state.last_search, &mut find_window);
     }
     if keep_open {
         let frame = render_find_window(&find_window, &gui_state.fonts);
@@ -813,14 +823,15 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
             .window
             .update_with_buffer(&frame.pixels, frame.width, frame.height)
             .map_err(|error| BlitzError::Window(error.to_string()))?;
-        gui_state.find_window = Some(find_window);
+    } else {
+        gui_state.find_window = None;
     }
     Ok(())
 }
 
 fn handle_find_window_keys(
     app: &mut BlitzApp,
-    gui_state: &mut GuiState,
+    last_search: &mut Option<SearchSpec>,
     find_window: &mut FindWindowState,
 ) -> bool {
     if find_window
@@ -834,9 +845,7 @@ fn handle_find_window_keys(
             .window
             .is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
     {
-        if let Err(error) = run_find_from_window(app, gui_state, find_window) {
-            show_find_error(gui_state, error);
-        }
+        run_find_from_window(app, last_search, find_window);
     }
     if find_window
         .window
@@ -856,17 +865,96 @@ fn handle_find_window_keys(
         .borrow_mut()
         .drain(..)
         .collect::<Vec<_>>();
-    for character in characters {
-        if !character.is_control() {
-            find_window.query.push(character);
+    if characters.is_empty() && !is_command_down(&find_window.window) {
+        for key in find_window.window.get_keys_pressed(KeyRepeat::Yes) {
+            if let Some(character) =
+                ascii_find_char_for_key(key, is_shift_down(&find_window.window))
+            {
+                find_window.query.push(character);
+            }
+        }
+    } else {
+        for character in characters {
+            if !character.is_control() {
+                find_window.query.push(character);
+            }
         }
     }
     true
 }
 
+fn ascii_find_char_for_key(key: Key, shift: bool) -> Option<char> {
+    match key {
+        Key::A => Some(if shift { 'A' } else { 'a' }),
+        Key::B => Some(if shift { 'B' } else { 'b' }),
+        Key::C => Some(if shift { 'C' } else { 'c' }),
+        Key::D => Some(if shift { 'D' } else { 'd' }),
+        Key::E => Some(if shift { 'E' } else { 'e' }),
+        Key::F => Some(if shift { 'F' } else { 'f' }),
+        Key::G => Some(if shift { 'G' } else { 'g' }),
+        Key::H => Some(if shift { 'H' } else { 'h' }),
+        Key::I => Some(if shift { 'I' } else { 'i' }),
+        Key::J => Some(if shift { 'J' } else { 'j' }),
+        Key::K => Some(if shift { 'K' } else { 'k' }),
+        Key::L => Some(if shift { 'L' } else { 'l' }),
+        Key::M => Some(if shift { 'M' } else { 'm' }),
+        Key::N => Some(if shift { 'N' } else { 'n' }),
+        Key::O => Some(if shift { 'O' } else { 'o' }),
+        Key::P => Some(if shift { 'P' } else { 'p' }),
+        Key::Q => Some(if shift { 'Q' } else { 'q' }),
+        Key::R => Some(if shift { 'R' } else { 'r' }),
+        Key::S => Some(if shift { 'S' } else { 's' }),
+        Key::T => Some(if shift { 'T' } else { 't' }),
+        Key::U => Some(if shift { 'U' } else { 'u' }),
+        Key::V => Some(if shift { 'V' } else { 'v' }),
+        Key::W => Some(if shift { 'W' } else { 'w' }),
+        Key::X => Some(if shift { 'X' } else { 'x' }),
+        Key::Y => Some(if shift { 'Y' } else { 'y' }),
+        Key::Z => Some(if shift { 'Z' } else { 'z' }),
+        Key::Key0 => Some(if shift { ')' } else { '0' }),
+        Key::Key1 => Some(if shift { '!' } else { '1' }),
+        Key::Key2 => Some(if shift { '@' } else { '2' }),
+        Key::Key3 => Some(if shift { '#' } else { '3' }),
+        Key::Key4 => Some(if shift { '$' } else { '4' }),
+        Key::Key5 => Some(if shift { '%' } else { '5' }),
+        Key::Key6 => Some(if shift { '^' } else { '6' }),
+        Key::Key7 => Some(if shift { '&' } else { '7' }),
+        Key::Key8 => Some(if shift { '*' } else { '8' }),
+        Key::Key9 => Some(if shift { '(' } else { '9' }),
+        Key::Space => Some(' '),
+        Key::Minus => Some(if shift { '_' } else { '-' }),
+        Key::Equal => Some(if shift { '+' } else { '=' }),
+        Key::Comma => Some(if shift { '<' } else { ',' }),
+        Key::Period => Some(if shift { '>' } else { '.' }),
+        Key::Slash => Some(if shift { '?' } else { '/' }),
+        Key::Semicolon => Some(if shift { ':' } else { ';' }),
+        Key::Apostrophe => Some(if shift { '"' } else { '\'' }),
+        Key::LeftBracket => Some(if shift { '{' } else { '[' }),
+        Key::RightBracket => Some(if shift { '}' } else { ']' }),
+        Key::Backslash => Some(if shift { '|' } else { '\\' }),
+        Key::Backquote => Some(if shift { '~' } else { '`' }),
+        Key::NumPad0 => Some('0'),
+        Key::NumPad1 => Some('1'),
+        Key::NumPad2 => Some('2'),
+        Key::NumPad3 => Some('3'),
+        Key::NumPad4 => Some('4'),
+        Key::NumPad5 => Some('5'),
+        Key::NumPad6 => Some('6'),
+        Key::NumPad7 => Some('7'),
+        Key::NumPad8 => Some('8'),
+        Key::NumPad9 => Some('9'),
+        Key::NumPadDot => Some('.'),
+        Key::NumPadSlash => Some('/'),
+        Key::NumPadAsterisk => Some('*'),
+        Key::NumPadMinus => Some('-'),
+        Key::NumPadPlus => Some('+'),
+        _ => None,
+    }
+}
+
 fn handle_find_window_mouse(
     app: &mut BlitzApp,
-    gui_state: &mut GuiState,
+    last_search: &mut Option<SearchSpec>,
     find_window: &mut FindWindowState,
 ) -> bool {
     let mouse_down = find_window.window.get_mouse_down(MouseButton::Left);
@@ -884,9 +972,7 @@ fn handle_find_window_mouse(
 
     if hit_rect(x, y, FIND_NEXT_BUTTON_RECT) {
         if !find_window.query.is_empty() {
-            if let Err(error) = run_find_from_window(app, gui_state, find_window) {
-                show_find_error(gui_state, error);
-            }
+            run_find_from_window(app, last_search, find_window);
         }
     } else if hit_rect(x, y, FIND_CANCEL_BUTTON_RECT) {
         return false;
@@ -905,36 +991,28 @@ fn handle_find_window_mouse(
 
 fn run_find_from_window(
     app: &mut BlitzApp,
-    gui_state: &mut GuiState,
+    last_search: &mut Option<SearchSpec>,
     find_window: &FindWindowState,
-) -> Result<()> {
+) {
     if find_window.query.is_empty() {
-        return Ok(());
+        return;
     }
 
-    if app.find_text_with_options(
-        &find_window.query,
-        find_window.match_case,
-        find_window.forward,
-        find_window.wrap_around,
-    )? {
-        gui_state.last_search = Some(SearchSpec {
+    if app
+        .find_text_with_options(
+            &find_window.query,
+            find_window.match_case,
+            find_window.forward,
+            find_window.wrap_around,
+        )
+        .unwrap_or(false)
+    {
+        *last_search = Some(SearchSpec {
             query: find_window.query.clone(),
             match_case: find_window.match_case,
             wrap_around: find_window.wrap_around,
         });
-        gui_state.set_message("Found");
-    } else {
-        gui_state.set_message("Cannot find text");
     }
-    Ok(())
-}
-
-fn show_find_error(gui_state: &mut GuiState, error: BlitzError) {
-    gui_state.dialog = Some(DialogState::Info {
-        title: "Find".to_owned(),
-        message: format!("Find failed: {error}"),
-    });
 }
 
 fn hit_rect(x: usize, y: usize, rect: Rect) -> bool {
@@ -947,7 +1025,14 @@ fn render_find_window(find_window: &FindWindowState, fonts: &FontStack) -> Rende
 
 fn render_find_window_view(view: &FindWindowView, fonts: &FontStack) -> RenderFrame {
     let mut canvas = Canvas::new(FIND_WINDOW_WIDTH, FIND_WINDOW_HEIGHT, COLOR_WINDOW);
-    canvas.text(16, 22, "Find what:", COLOR_TEXT, TextRole::Find, fonts);
+    canvas.text(
+        16,
+        centered_text_y(FIND_FIELD_RECT, TextRole::Find),
+        "Find what:",
+        COLOR_TEXT,
+        TextRole::Find,
+        fonts,
+    );
     draw_find_text_field(&mut canvas, fonts, &view.query);
     draw_find_button(
         &mut canvas,
@@ -1007,7 +1092,7 @@ fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str) {
     );
     canvas.text(
         FIND_FIELD_RECT.x + 6,
-        FIND_FIELD_RECT.y + 6,
+        centered_text_y(FIND_FIELD_RECT, TextRole::Find),
         visible,
         COLOR_TEXT,
         TextRole::Find,
@@ -1044,19 +1129,27 @@ fn draw_find_button(
             .width
             .saturating_sub(fonts.measure(label, TextRole::Find))
             / 2;
-    canvas.text(text_x, rect.y + 5, label, text_color, TextRole::Find, fonts);
+    canvas.text(
+        text_x,
+        centered_text_y(rect, TextRole::Find),
+        label,
+        text_color,
+        TextRole::Find,
+        fonts,
+    );
 }
 
 fn draw_checkbox(canvas: &mut Canvas, fonts: &FontStack, rect: Rect, label: &str, checked: bool) {
-    canvas.fill_rect(rect.x, rect.y + 3, 14, 14, COLOR_TEXT_AREA);
-    canvas.rect(rect.x, rect.y + 3, 14, 14, COLOR_TEXT);
+    let box_y = rect.y + (rect.height.saturating_sub(14)) / 2;
+    canvas.fill_rect(rect.x, box_y, 14, 14, COLOR_TEXT_AREA);
+    canvas.rect(rect.x, box_y, 14, 14, COLOR_TEXT);
     if checked {
-        canvas.line(rect.x + 3, rect.y + 10, rect.x + 6, rect.y + 14, COLOR_TEXT);
-        canvas.line(rect.x + 6, rect.y + 14, rect.x + 12, rect.y + 5, COLOR_TEXT);
+        canvas.line(rect.x + 3, box_y + 7, rect.x + 6, box_y + 11, COLOR_TEXT);
+        canvas.line(rect.x + 6, box_y + 11, rect.x + 12, box_y + 2, COLOR_TEXT);
     }
     canvas.text(
         rect.x + 22,
-        rect.y + 1,
+        centered_text_y(rect, TextRole::Find),
         label,
         COLOR_TEXT,
         TextRole::Find,
@@ -1091,19 +1184,28 @@ fn draw_radio_button(
     checked: bool,
 ) {
     let cx = rect.x + 8;
-    let cy = rect.y + 12;
+    let cy = rect.y + rect.height / 2;
     draw_circle(canvas, cx as i32, cy as i32, 7, COLOR_TEXT);
     if checked {
         canvas.fill_rect(cx - 3, cy - 3, 6, 6, COLOR_TEXT);
     }
     canvas.text(
         rect.x + 20,
-        rect.y + 3,
+        centered_text_y(rect, TextRole::Find),
         label,
         COLOR_TEXT,
         TextRole::Find,
         fonts,
     );
+}
+
+fn centered_text_y(rect: Rect, role: TextRole) -> usize {
+    let text_height = match role {
+        TextRole::Find => 16,
+        TextRole::Ui => 18,
+        TextRole::Editor => EDITOR_LINE_HEIGHT,
+    };
+    rect.y + rect.height.saturating_sub(text_height) / 2
 }
 
 fn draw_circle(canvas: &mut Canvas, center_x: i32, center_y: i32, radius: i32, color: u32) {
@@ -3910,11 +4012,31 @@ mod tests {
         assert_eq!(frame.width, FIND_WINDOW_WIDTH);
         assert_eq!(frame.height, FIND_WINDOW_HEIGHT);
         assert!(fonts.measure("Find Next", TextRole::Find) <= FIND_NEXT_BUTTON_RECT.width - 8);
+        assert_eq!(FIND_FIELD_RECT.y, FIND_NEXT_BUTTON_RECT.y);
+        assert_eq!(FIND_FIELD_RECT.height, FIND_NEXT_BUTTON_RECT.height);
+        assert_eq!(FIND_NEXT_BUTTON_RECT.x, FIND_CANCEL_BUTTON_RECT.x);
+        assert_eq!(FIND_NEXT_BUTTON_RECT.width, FIND_CANCEL_BUTTON_RECT.width);
+        assert!(
+            FIND_CANCEL_BUTTON_RECT.y + FIND_CANCEL_BUTTON_RECT.height
+                <= FIND_DIRECTION_GROUP_RECT.y
+        );
+        assert!(
+            FIND_CANCEL_BUTTON_RECT.y + FIND_CANCEL_BUTTON_RECT.height <= FIND_MATCH_CASE_RECT.y
+        );
+        assert!(FIND_WRAP_RECT.y + FIND_WRAP_RECT.height <= FIND_WINDOW_HEIGHT);
+        assert!(
+            FIND_DIRECTION_GROUP_RECT.y + FIND_DIRECTION_GROUP_RECT.height <= FIND_WINDOW_HEIGHT
+        );
         assert!(
             FIND_DOWN_RADIO_RECT.x + FIND_DOWN_RADIO_RECT.width
                 <= FIND_DIRECTION_GROUP_RECT.x + FIND_DIRECTION_GROUP_RECT.width
         );
+        assert!(
+            FIND_DIRECTION_GROUP_RECT.x + FIND_DIRECTION_GROUP_RECT.width
+                < FIND_CANCEL_BUTTON_RECT.x
+        );
         assert!(FIND_UP_RADIO_RECT.x >= FIND_DIRECTION_GROUP_RECT.x);
+        assert!(FIND_UP_RADIO_RECT.x + FIND_UP_RADIO_RECT.width <= FIND_DOWN_RADIO_RECT.x);
         assert_eq!(
             frame.pixels[pixel_index(&frame, FIND_FIELD_RECT.x, FIND_FIELD_RECT.y)],
             0x000078d7
@@ -3935,6 +4057,16 @@ mod tests {
             )],
             COLOR_TEXT_AREA
         );
+    }
+
+    #[test]
+    fn find_textbox_ascii_key_fallback_maps_printable_keys() {
+        assert_eq!(ascii_find_char_for_key(Key::A, false), Some('a'));
+        assert_eq!(ascii_find_char_for_key(Key::A, true), Some('A'));
+        assert_eq!(ascii_find_char_for_key(Key::Key1, false), Some('1'));
+        assert_eq!(ascii_find_char_for_key(Key::Key1, true), Some('!'));
+        assert_eq!(ascii_find_char_for_key(Key::Space, false), Some(' '));
+        assert_eq!(ascii_find_char_for_key(Key::Enter, false), None);
     }
 
     #[test]
