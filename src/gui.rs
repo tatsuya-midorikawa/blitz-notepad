@@ -26,7 +26,7 @@ use swash::{
 };
 
 use crate::ui::{MenuItem, NotepadUiState, MENU_BAR};
-use crate::{BlitzApp, BlitzError, Result};
+use crate::{BlitzApp, BlitzError, Document, Result};
 
 const DEFAULT_WIDTH: usize = 960;
 const DEFAULT_HEIGHT: usize = 640;
@@ -51,6 +51,7 @@ const WHEEL_LINES: isize = 3;
 const HORIZONTAL_WHEEL_BYTES: isize = 96;
 const MIN_SCROLL_THUMB: usize = 32;
 const REVEAL_LINE_INDEX_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const PRINT_LINE_CHUNK_BYTES: usize = 64 * 1024;
 
 const COLOR_WINDOW: u32 = 0x00f0f0f0;
 const COLOR_TEXT_AREA: u32 = 0x00ffffff;
@@ -130,14 +131,16 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
     let mut last_title = String::new();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        app.set_clipboard_has_text(!gui_state.clipboard.is_empty());
+        app.set_clipboard_has_text(clipboard_has_text(&gui_state.clipboard));
         if handle_mouse(&window, &mut app, &mut gui_state)? {
             break;
         }
         handle_keys(&window, &mut app, &mut gui_state)?;
         handle_text_input(&input_queue, &window, &mut app, &mut gui_state)?;
         handle_find_window(&mut app, &mut gui_state)?;
+        handle_dialog_window(&mut app, &mut gui_state)?;
         poll_save_job(&mut app, &mut gui_state);
+        poll_print_job(&mut gui_state);
 
         let (width, height) = window.get_size();
         let width = width.max(MIN_WIDTH);
@@ -182,9 +185,11 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
 
 struct GuiState {
     active_menu: Option<usize>,
-    dialog: Option<DialogState>,
+    dialog: Option<DialogWindowState>,
+    pending_info_dialog: Option<DialogState>,
     find_window: Option<FindWindowState>,
     last_search: Option<SearchSpec>,
+    status_message: Option<String>,
     clipboard: String,
     mouse_was_down: bool,
     first_visible_line: usize,
@@ -196,6 +201,7 @@ struct GuiState {
     selection_focus: Option<usize>,
     mouse_selecting: bool,
     save_job: Option<SaveJob>,
+    print_job: Option<PrintJob>,
     fonts: FontStack,
 }
 
@@ -205,8 +211,10 @@ impl GuiState {
         Ok(Self {
             active_menu: None,
             dialog: None,
+            pending_info_dialog: None,
             find_window: None,
             last_search: None,
+            status_message: None,
             clipboard: String::new(),
             mouse_was_down: false,
             first_visible_line: 0,
@@ -218,17 +226,31 @@ impl GuiState {
             selection_focus: None,
             mouse_selecting: false,
             save_job: None,
+            print_job: None,
             fonts,
         })
     }
 
-    fn set_message(&mut self, _message: impl Into<String>) {}
+    fn set_message(&mut self, message: impl Into<String>) {
+        self.status_message = Some(message.into());
+    }
+
+    fn status_text(&self) -> Option<&str> {
+        if self.print_job.is_some() {
+            Some("Printing...")
+        } else if self.save_job.is_some() {
+            Some("Saving...")
+        } else {
+            self.status_message.as_deref()
+        }
+    }
 
     fn reset_scroll(&mut self, app: &BlitzApp) {
         self.first_visible_line = 0;
         self.horizontal_offset = 0;
         self.last_caret_offset = app.caret_offset();
         self.pending_reveal_selection = false;
+        self.status_message = None;
         self.selection_anchor = None;
         self.selection_focus = None;
         self.mouse_selecting = false;
@@ -352,6 +374,25 @@ struct SaveJobResult {
     result: Result<u64>,
 }
 
+struct PrintJob {
+    receiver: Receiver<PrintJobResult>,
+}
+
+struct PrintJobResult {
+    result: Result<PrintOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrintOutcome {
+    Submitted,
+    Cancelled,
+}
+
+struct PrintRequest {
+    document: Document,
+    title: String,
+}
+
 struct FindWindowState {
     window: Window,
     input_queue: Rc<RefCell<Vec<char>>>,
@@ -451,7 +492,7 @@ struct FrameSignature {
     ui_state: NotepadUiState,
     document_line_count: usize,
     active_menu: Option<usize>,
-    dialog: Option<DialogState>,
+    status_text: Option<String>,
     first_visible_line: usize,
     horizontal_offset: usize,
     selected_range: Option<std::ops::Range<usize>>,
@@ -476,7 +517,10 @@ fn frame_signature(
         ui_state: state.clone(),
         document_line_count: app.document().line_count_snapshot(),
         active_menu: gui_state.active_menu,
-        dialog: gui_state.dialog.clone(),
+        status_text: state
+            .status_bar_visible
+            .then(|| gui_state.status_text().map(str::to_owned))
+            .flatten(),
         first_visible_line: gui_state.first_visible_line,
         horizontal_offset: gui_state.horizontal_offset,
         selected_range: app.selected_range(),
@@ -488,6 +532,12 @@ struct SearchSpec {
     query: String,
     match_case: bool,
     wrap_around: bool,
+}
+
+struct DialogWindowState {
+    window: Window,
+    input_queue: Rc<RefCell<Vec<char>>>,
+    state: DialogState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1102,6 +1152,175 @@ fn render_find_window(find_window: &FindWindowState, fonts: &FontStack) -> Rende
     render_find_window_view(&find_window.view(), fonts)
 }
 
+fn open_dialog_window(gui_state: &mut GuiState, state: DialogState) -> Result<()> {
+    if should_defer_dialog_window(&state, gui_state.dialog.is_some()) {
+        gui_state.pending_info_dialog = Some(state);
+        return Ok(());
+    }
+
+    let title = dialog_window_title(&state).to_owned();
+    let (width, height) = dialog_window_size(&state);
+    let input_queue = Rc::new(RefCell::new(Vec::new()));
+    let window = Window::new(
+        &title,
+        width,
+        height,
+        WindowOptions {
+            resize: false,
+            ..WindowOptions::default()
+        },
+    )
+    .map_err(|error| BlitzError::Window(error.to_string()))?;
+
+    gui_state.dialog = Some(DialogWindowState {
+        window,
+        input_queue: Rc::clone(&input_queue),
+        state,
+    });
+    if let Some(dialog) = gui_state.dialog.as_mut() {
+        dialog
+            .window
+            .set_input_callback(Box::new(TextInput::new(input_queue)));
+    }
+    Ok(())
+}
+
+fn should_defer_dialog_window(state: &DialogState, dialog_open: bool) -> bool {
+    dialog_open && matches!(state, DialogState::Info { .. })
+}
+
+fn open_info_window(gui_state: &mut GuiState, title: &str, message: &str) -> Result<()> {
+    open_dialog_window(
+        gui_state,
+        DialogState::Info {
+            title: title.to_owned(),
+            message: message.to_owned(),
+        },
+    )
+}
+
+fn dialog_window_title(state: &DialogState) -> &'static str {
+    match state {
+        DialogState::Replace { .. } => "Replace",
+        DialogState::GoTo { .. } => "Go To Line",
+        DialogState::Info { title, .. } => match title.as_str() {
+            "Page Setup" => "Page Setup",
+            "Print" => "Print",
+            "Font" => "Font",
+            "About Notepad" => "About Notepad",
+            "Save" => "Save",
+            _ => "Notepad",
+        },
+    }
+}
+
+fn dialog_window_size(state: &DialogState) -> (usize, usize) {
+    match state {
+        DialogState::Replace { .. } => (470, 220),
+        DialogState::GoTo { .. } => (360, 180),
+        DialogState::Info { .. } => (470, 210),
+    }
+}
+
+fn handle_dialog_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    let Some(mut dialog) = gui_state.dialog.take() else {
+        return Ok(());
+    };
+
+    let frame = render_dialog_window(&dialog.state, &gui_state.fonts);
+    dialog
+        .window
+        .update_with_buffer(&frame.pixels, frame.width, frame.height)
+        .map_err(|error| BlitzError::Window(error.to_string()))?;
+
+    let mut keep_open = dialog.window.is_open();
+    if keep_open {
+        keep_open = handle_dialog_window_keys(
+            app,
+            &mut gui_state.last_search,
+            &mut gui_state.pending_reveal_selection,
+            &mut gui_state.clipboard,
+            &mut dialog,
+        )?;
+    }
+    if keep_open {
+        handle_dialog_window_text_input(&mut dialog);
+    }
+
+    if keep_open {
+        let frame = render_dialog_window(&dialog.state, &gui_state.fonts);
+        dialog
+            .window
+            .update_with_buffer(&frame.pixels, frame.width, frame.height)
+            .map_err(|error| BlitzError::Window(error.to_string()))?;
+        gui_state.dialog = Some(dialog);
+    } else if let Some(pending) = gui_state.pending_info_dialog.take() {
+        open_dialog_window(gui_state, pending)?;
+    }
+
+    Ok(())
+}
+
+fn handle_dialog_window_keys(
+    app: &mut BlitzApp,
+    last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
+    clipboard: &mut String,
+    dialog: &mut DialogWindowState,
+) -> Result<bool> {
+    if dialog.window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+        return Ok(false);
+    }
+    if is_command_down(&dialog.window) && dialog.window.is_key_pressed(Key::V, KeyRepeat::No) {
+        paste_into_dialog_field(&mut dialog.state, clipboard);
+        dialog.input_queue.borrow_mut().clear();
+        return Ok(true);
+    }
+    if dialog.window.is_key_pressed(Key::Backspace, KeyRepeat::Yes) {
+        backspace_dialog_field(&mut dialog.state);
+    }
+    if dialog.window.is_key_pressed(Key::Tab, KeyRepeat::No) {
+        tab_dialog_field(&mut dialog.state);
+    }
+    if dialog.window.is_key_pressed(Key::Space, KeyRepeat::No) {
+        toggle_dialog_option(&mut dialog.state);
+    }
+    if dialog.window.is_key_pressed(Key::Enter, KeyRepeat::No)
+        || dialog
+            .window
+            .is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
+    {
+        return accept_dialog_state(
+            app,
+            last_search,
+            pending_reveal_selection,
+            &mut dialog.state,
+            is_command_down(&dialog.window),
+        );
+    }
+    Ok(true)
+}
+
+fn handle_dialog_window_text_input(dialog: &mut DialogWindowState) {
+    let characters = dialog
+        .input_queue
+        .borrow_mut()
+        .drain(..)
+        .collect::<Vec<_>>();
+    for character in characters {
+        if !character.is_control() {
+            append_dialog_character(&mut dialog.state, character);
+        }
+    }
+}
+
+fn render_dialog_window(dialog: &DialogState, fonts: &FontStack) -> RenderFrame {
+    let (width, height) = dialog_window_size(dialog);
+    let mut canvas = Canvas::new(width, height, COLOR_WINDOW);
+    draw_dialog(&mut canvas, dialog, fonts);
+    canvas.into_frame()
+}
+
 fn render_find_window_view(view: &FindWindowView, fonts: &FontStack) -> RenderFrame {
     let mut canvas = Canvas::new(FIND_WINDOW_WIDTH, FIND_WINDOW_HEIGHT, COLOR_WINDOW);
     canvas.text(
@@ -1350,7 +1569,7 @@ fn scroll_page(
 
 fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
     if gui_state.dialog.is_some() {
-        return handle_dialog_keys(window, app, gui_state);
+        return Ok(());
     }
 
     if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
@@ -1378,34 +1597,37 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
             }
         }
         if window.is_key_pressed(Key::P, KeyRepeat::No) {
-            gui_state.dialog = Some(DialogState::Info {
-                title: "Print".to_owned(),
-                message: "Native print dialog integration is not available in this software-rendered window yet.".to_owned(),
-            });
+            start_background_print(app, gui_state)?;
         }
         if window.is_key_pressed(Key::F, KeyRepeat::No) {
             open_find_window(app, gui_state)?;
         }
         if window.is_key_pressed(Key::H, KeyRepeat::No) {
-            gui_state.dialog = Some(DialogState::Replace {
-                query: app
-                    .selected_text()
-                    .or_else(|| {
-                        gui_state
-                            .last_search
-                            .as_ref()
-                            .map(|search| search.query.clone())
-                    })
-                    .unwrap_or_default(),
-                replacement: String::new(),
-                active_field: ReplaceField::Find,
-                match_case: false,
-            });
+            open_dialog_window(
+                gui_state,
+                DialogState::Replace {
+                    query: app
+                        .selected_text()
+                        .or_else(|| {
+                            gui_state
+                                .last_search
+                                .as_ref()
+                                .map(|search| search.query.clone())
+                        })
+                        .unwrap_or_default(),
+                    replacement: String::new(),
+                    active_field: ReplaceField::Find,
+                    match_case: false,
+                },
+            )?;
         }
         if window.is_key_pressed(Key::G, KeyRepeat::No) && !app.settings().word_wrap {
-            gui_state.dialog = Some(DialogState::GoTo {
-                line: String::new(),
-            });
+            open_dialog_window(
+                gui_state,
+                DialogState::GoTo {
+                    line: String::new(),
+                },
+            )?;
         }
         if window.is_key_pressed(Key::E, KeyRepeat::No) {
             search_with_bing(app, gui_state);
@@ -1535,12 +1757,7 @@ fn handle_text_input(
     gui_state: &mut GuiState,
 ) -> Result<()> {
     if gui_state.dialog.is_some() {
-        let characters = input_queue.borrow_mut().drain(..).collect::<Vec<_>>();
-        for character in characters {
-            if !character.is_control() {
-                append_dialog_character(gui_state, character);
-            }
-        }
+        input_queue.borrow_mut().clear();
         return Ok(());
     }
 
@@ -1560,53 +1777,30 @@ fn handle_text_input(
     Ok(())
 }
 
-fn handle_dialog_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
-    if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
-        gui_state.dialog = None;
-        return Ok(());
-    }
-
-    if window.is_key_pressed(Key::Backspace, KeyRepeat::Yes) {
-        backspace_dialog_field(gui_state);
-    }
-    if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
-        tab_dialog_field(gui_state);
-    }
-    if window.is_key_pressed(Key::Space, KeyRepeat::No) {
-        toggle_dialog_option(gui_state);
-    }
-    if window.is_key_pressed(Key::Enter, KeyRepeat::No)
-        || window.is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
-    {
-        accept_dialog(app, gui_state, is_command_down(window))?;
-    }
-    Ok(())
-}
-
-fn append_dialog_character(gui_state: &mut GuiState, character: char) {
-    match gui_state.dialog.as_mut() {
-        Some(DialogState::Replace {
+fn append_dialog_character(dialog: &mut DialogState, character: char) {
+    match dialog {
+        DialogState::Replace {
             query,
             replacement,
             active_field,
             ..
-        }) => match active_field {
+        } => match active_field {
             ReplaceField::Find => query.push(character),
             ReplaceField::Replace => replacement.push(character),
         },
-        Some(DialogState::GoTo { line }) if character.is_ascii_digit() => line.push(character),
+        DialogState::GoTo { line } if character.is_ascii_digit() => line.push(character),
         _ => {}
     }
 }
 
-fn backspace_dialog_field(gui_state: &mut GuiState) {
-    match gui_state.dialog.as_mut() {
-        Some(DialogState::Replace {
+fn backspace_dialog_field(dialog: &mut DialogState) {
+    match dialog {
+        DialogState::Replace {
             query,
             replacement,
             active_field,
             ..
-        }) => match active_field {
+        } => match active_field {
             ReplaceField::Find => {
                 query.pop();
             }
@@ -1614,15 +1808,15 @@ fn backspace_dialog_field(gui_state: &mut GuiState) {
                 replacement.pop();
             }
         },
-        Some(DialogState::GoTo { line }) => {
+        DialogState::GoTo { line } => {
             line.pop();
         }
         _ => {}
     }
 }
 
-fn tab_dialog_field(gui_state: &mut GuiState) {
-    if let Some(DialogState::Replace { active_field, .. }) = gui_state.dialog.as_mut() {
+fn tab_dialog_field(dialog: &mut DialogState) {
+    if let DialogState::Replace { active_field, .. } = dialog {
         *active_field = match active_field {
             ReplaceField::Find => ReplaceField::Replace,
             ReplaceField::Replace => ReplaceField::Find,
@@ -1630,18 +1824,45 @@ fn tab_dialog_field(gui_state: &mut GuiState) {
     }
 }
 
-fn toggle_dialog_option(gui_state: &mut GuiState) {
-    match gui_state.dialog.as_mut() {
-        Some(DialogState::Replace { match_case, .. }) => *match_case = !*match_case,
+fn toggle_dialog_option(dialog: &mut DialogState) {
+    match dialog {
+        DialogState::Replace { match_case, .. } => *match_case = !*match_case,
         _ => {}
     }
 }
 
-fn accept_dialog(app: &mut BlitzApp, gui_state: &mut GuiState, command_down: bool) -> Result<()> {
-    let Some(dialog) = gui_state.dialog.clone() else {
-        return Ok(());
-    };
+fn paste_into_dialog_field(dialog: &mut DialogState, clipboard_cache: &mut String) {
+    let pasted = clipboard_text(clipboard_cache);
+    if pasted.is_empty() {
+        return;
+    }
+    match dialog {
+        DialogState::Replace {
+            query,
+            replacement,
+            active_field,
+            ..
+        } => match active_field {
+            ReplaceField::Find => query.push_str(&pasted),
+            ReplaceField::Replace => replacement.push_str(&pasted),
+        },
+        DialogState::GoTo { line } => line.extend(
+            pasted
+                .chars()
+                .filter(|character| character.is_ascii_digit()),
+        ),
+        DialogState::Info { .. } => {}
+    }
+    *clipboard_cache = pasted;
+}
 
+fn accept_dialog_state(
+    app: &mut BlitzApp,
+    last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
+    dialog: &mut DialogState,
+    command_down: bool,
+) -> Result<bool> {
     match dialog {
         DialogState::Replace {
             query,
@@ -1649,34 +1870,29 @@ fn accept_dialog(app: &mut BlitzApp, gui_state: &mut GuiState, command_down: boo
             match_case,
             ..
         } => {
-            gui_state.last_search = Some(SearchSpec {
+            *last_search = Some(SearchSpec {
                 query: query.clone(),
-                match_case,
+                match_case: *match_case,
                 wrap_around: true,
             });
             if command_down {
-                let count = app.replace_all(&query, &replacement, match_case)?;
-                gui_state.set_message(format!("Replaced {count}"));
-            } else if app.replace_next(&query, &replacement, match_case)? {
-                gui_state.set_message("Replaced");
-            } else {
-                gui_state.set_message("Cannot find text");
+                let count = app.replace_all(query, replacement, *match_case)?;
+                let _ = count;
+            } else if app.replace_next(query, replacement, *match_case)? {
+                *pending_reveal_selection = true;
             }
+            Ok(true)
         }
         DialogState::GoTo { line } => {
             let parsed = line.parse::<usize>().unwrap_or(0);
             if app.go_to_line(parsed)? {
-                gui_state.dialog = None;
-                gui_state.set_message(format!("Ln {parsed}"));
+                Ok(false)
             } else {
-                gui_state.set_message("Invalid line number");
+                Ok(true)
             }
         }
-        DialogState::Info { .. } => {
-            gui_state.dialog = None;
-        }
+        DialogState::Info { .. } => Ok(false),
     }
-    Ok(())
 }
 
 fn is_command_down(window: &Window) -> bool {
@@ -1715,16 +1931,14 @@ fn execute_menu_row(
         }
         ("File", "Save As...") => save_as_dialog(app, gui_state)?,
         ("File", "Page Setup...") => {
-            gui_state.dialog = Some(DialogState::Info {
-                title: "Page Setup".to_owned(),
-                message: "Page setup options are not persisted yet. Header, footer, margins, and orientation will be added to the print pipeline.".to_owned(),
-            });
+            open_info_window(
+                gui_state,
+                "Page Setup",
+                "Page setup options are not persisted yet. Header, footer, margins, and orientation will be added to the print pipeline.",
+            )?;
         }
         ("File", "Print...") => {
-            gui_state.dialog = Some(DialogState::Info {
-                title: "Print".to_owned(),
-                message: "Native print dialog integration is not available in this software-rendered window yet.".to_owned(),
-            });
+            start_background_print(app, gui_state)?;
         }
         ("File", "Exit") => return confirm_unsaved_changes(app, gui_state),
         ("Edit", "Undo") => {
@@ -1773,32 +1987,39 @@ fn execute_menu_row(
         ("Edit", "Find Next") => find_again(app, gui_state, true)?,
         ("Edit", "Find Previous") => find_again(app, gui_state, false)?,
         ("Edit", "Replace...") => {
-            gui_state.dialog = Some(DialogState::Replace {
-                query: app
-                    .selected_text()
-                    .or_else(|| {
-                        gui_state
-                            .last_search
-                            .as_ref()
-                            .map(|search| search.query.clone())
-                    })
-                    .unwrap_or_default(),
-                replacement: String::new(),
-                active_field: ReplaceField::Find,
-                match_case: false,
-            });
+            open_dialog_window(
+                gui_state,
+                DialogState::Replace {
+                    query: app
+                        .selected_text()
+                        .or_else(|| {
+                            gui_state
+                                .last_search
+                                .as_ref()
+                                .map(|search| search.query.clone())
+                        })
+                        .unwrap_or_default(),
+                    replacement: String::new(),
+                    active_field: ReplaceField::Find,
+                    match_case: false,
+                },
+            )?;
         }
         ("Edit", "Go To...") => {
-            gui_state.dialog = Some(DialogState::GoTo {
-                line: String::new(),
-            });
+            open_dialog_window(
+                gui_state,
+                DialogState::GoTo {
+                    line: String::new(),
+                },
+            )?;
         }
         ("Format", "Word Wrap") => app.toggle_word_wrap(),
         ("Format", "Font...") => {
-            gui_state.dialog = Some(DialogState::Info {
-                title: "Font".to_owned(),
-                message: format!("Current font stack: {}\nSample: AaBbYyZz\nAptos / Yu Gothic UI are preferred when available.", gui_state.fonts.description()),
-            });
+            open_info_window(
+                gui_state,
+                "Font",
+                &format!("Current font stack: {}\nSample: AaBbYyZz\nAptos / Yu Gothic UI are preferred when available.", gui_state.fonts.description()),
+            )?;
         }
         ("View", "Zoom In") => app.zoom_in(),
         ("View", "Zoom Out") => app.zoom_out(),
@@ -1807,10 +2028,11 @@ fn execute_menu_row(
         ("Help", "View Help") => open_browser("https://github.com/", gui_state),
         ("Help", "Send Feedback") => open_browser("https://github.com/", gui_state),
         ("Help", "About Notepad") => {
-            gui_state.dialog = Some(DialogState::Info {
-                title: "About Notepad".to_owned(),
-                message: "blitzpad 0.1.0\nNotepad-compatible editor".to_owned(),
-            });
+            open_info_window(
+                gui_state,
+                "About Notepad",
+                "blitzpad 0.1.0\nNotepad-compatible editor",
+            )?;
         }
         (_, label) => gui_state.set_message(format!("{label} is not available yet")),
     }
@@ -1948,21 +2170,433 @@ fn poll_save_job(app: &mut BlitzApp, gui_state: &mut GuiState) {
                     }
                 }
                 Err(error) => {
-                    gui_state.dialog = Some(DialogState::Info {
-                        title: "Save".to_owned(),
-                        message: format!("Save failed: {error}"),
-                    });
+                    let _ = open_info_window(gui_state, "Save", &format!("Save failed: {error}"));
                 }
             }
         }
         Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => {
             gui_state.save_job = None;
-            gui_state.dialog = Some(DialogState::Info {
-                title: "Save".to_owned(),
-                message: "Save failed: worker stopped".to_owned(),
-            });
+            let _ = open_info_window(gui_state, "Save", "Save failed: worker stopped");
         }
+    }
+}
+
+fn start_background_print(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    if gui_state.print_job.is_some() {
+        gui_state.set_message("Printing...");
+        return Ok(());
+    }
+
+    let request = match print_request_for_app(app) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = open_info_window(gui_state, "Print", &format!("Print failed: {error}"));
+            return Ok(());
+        }
+    };
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("blitz-print".to_owned())
+        .spawn(move || {
+            let result = run_print_request(request);
+            let _ = sender.send(PrintJobResult { result });
+        })?;
+    gui_state.print_job = Some(PrintJob { receiver });
+    gui_state.set_message("Printing...");
+    Ok(())
+}
+
+fn poll_print_job(gui_state: &mut GuiState) {
+    let Some(received) = gui_state
+        .print_job
+        .as_ref()
+        .map(|job| job.receiver.try_recv())
+    else {
+        return;
+    };
+
+    match received {
+        Ok(result) => {
+            gui_state.print_job = None;
+            match result.result {
+                Ok(PrintOutcome::Submitted) => gui_state.set_message("Printed"),
+                Ok(PrintOutcome::Cancelled) => gui_state.set_message("Print canceled"),
+                Err(error) => {
+                    let _ = open_info_window(gui_state, "Print", &format!("Print failed: {error}"));
+                }
+            }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            gui_state.print_job = None;
+            let _ = open_info_window(gui_state, "Print", "Print failed: worker stopped");
+        }
+    }
+}
+
+fn print_request_for_app(app: &BlitzApp) -> Result<PrintRequest> {
+    Ok(PrintRequest {
+        document: app.document().snapshot_clone(),
+        title: app.document().file_name(),
+    })
+}
+
+fn run_print_request(request: PrintRequest) -> Result<PrintOutcome> {
+    print_document_with_platform(&request.document, &request.title)
+}
+
+fn visit_print_lines(document: &Document, mut visit: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    let mut line = Vec::new();
+    let mut emitted_any = false;
+
+    document.for_each_chunk(|chunk| {
+        for &byte in chunk {
+            if byte == b'\n' {
+                emit_print_line(&mut line, &mut visit)?;
+                emitted_any = true;
+            } else {
+                line.push(byte);
+                while line.len() >= PRINT_LINE_CHUNK_BYTES {
+                    let split_at = utf8_prefix_boundary(&line, PRINT_LINE_CHUNK_BYTES);
+                    if split_at == 0 {
+                        break;
+                    }
+                    emit_print_line_part(&mut line, split_at, &mut visit)?;
+                    emitted_any = true;
+                }
+            }
+        }
+        Ok::<(), BlitzError>(())
+    })?;
+
+    if !line.is_empty() || !emitted_any {
+        emit_print_line(&mut line, &mut visit)?;
+    }
+    Ok(())
+}
+
+fn emit_print_line(line: &mut Vec<u8>, visit: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    emit_print_line_part(line, line.len(), visit)
+}
+
+fn emit_print_line_part(
+    line: &mut Vec<u8>,
+    end: usize,
+    visit: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let end = end.min(line.len());
+    let text = String::from_utf8_lossy(&line[..end]);
+    visit(&text)?;
+    line.drain(..end);
+    Ok(())
+}
+
+fn utf8_prefix_boundary(bytes: &[u8], max_len: usize) -> usize {
+    let mut end = max_len.min(bytes.len());
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    end
+}
+
+#[cfg(target_os = "windows")]
+fn print_document_with_platform(document: &Document, title: &str) -> Result<PrintOutcome> {
+    gdi_print::print_document(document, title)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn print_document_with_platform(document: &Document, title: &str) -> Result<PrintOutcome> {
+    let path = temporary_print_path(title);
+    document.save_snapshot_to_path(&path, document.encoding(), document.line_ending())?;
+    let status = Command::new("lp").arg(&path).status();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(status) if status.success() => Ok(PrintOutcome::Submitted),
+        Ok(status) => Err(BlitzError::Window(format!(
+            "print command exited with {status}"
+        ))),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn temporary_print_path(file_name: &str) -> std::path::PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let name = sanitized_print_file_name(file_name);
+    env::temp_dir().join(format!(
+        "blitzpad-print-{}-{timestamp}-{name}.txt",
+        std::process::id()
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sanitized_print_file_name(file_name: &str) -> String {
+    let sanitized = file_name
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => character,
+            _ => '_',
+        })
+        .take(64)
+        .collect::<String>();
+    if sanitized.trim_matches('_').is_empty() {
+        "Untitled".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod gdi_print {
+    use std::mem::{size_of, zeroed};
+    use std::ptr::null;
+
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDeviceCaps, GetTextMetricsW,
+        SelectObject, SetBkMode, SetMapMode, SetTextColor, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+        DEFAULT_QUALITY, DT_EXPANDTABS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, FF_MODERN,
+        FIXED_PITCH, FW_NORMAL, HDC, HFONT, HGDIOBJ, HORZRES, LOGPIXELSX, LOGPIXELSY, MM_TEXT,
+        OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT, VERTRES,
+    };
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, PrintDlgW, PD_NOPAGENUMS, PD_NOSELECTION, PD_RETURNDC,
+        PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW,
+    };
+
+    use super::{visit_print_lines, Document, PrintOutcome};
+    use crate::{BlitzError, Result};
+
+    const PRINT_POINT_SIZE: i32 = 10;
+
+    #[repr(C)]
+    struct DocInfoW {
+        cb_size: i32,
+        doc_name: *const u16,
+        output: *const u16,
+        datatype: *const u16,
+        fw_type: u32,
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn StartDocW(hdc: HDC, lpdi: *const DocInfoW) -> i32;
+        fn EndDoc(hdc: HDC) -> i32;
+        fn StartPage(hdc: HDC) -> i32;
+        fn EndPage(hdc: HDC) -> i32;
+        fn AbortDoc(hdc: HDC) -> i32;
+    }
+
+    pub(super) fn print_document(document: &Document, title: &str) -> Result<PrintOutcome> {
+        unsafe {
+            let mut dialog: PRINTDLGW = zeroed();
+            dialog.lStructSize = size_of::<PRINTDLGW>() as u32;
+            dialog.Flags =
+                PD_RETURNDC | PD_NOSELECTION | PD_NOPAGENUMS | PD_USEDEVMODECOPIESANDCOLLATE;
+
+            if PrintDlgW(&mut dialog) == 0 {
+                let error = CommDlgExtendedError();
+                return if error == 0 {
+                    Ok(PrintOutcome::Cancelled)
+                } else {
+                    Err(BlitzError::Window(format!(
+                        "PrintDlgW failed with common dialog error {error}"
+                    )))
+                };
+            }
+
+            let hdc = dialog.hDC;
+            let result = if hdc.is_null() {
+                Err(BlitzError::Window(
+                    "print dialog did not return a printer device context".to_owned(),
+                ))
+            } else {
+                print_to_hdc(hdc, document, title)
+            };
+
+            if !hdc.is_null() {
+                DeleteDC(hdc);
+            }
+            if !dialog.hDevMode.is_null() {
+                GlobalFree(dialog.hDevMode);
+            }
+            if !dialog.hDevNames.is_null() {
+                GlobalFree(dialog.hDevNames);
+            }
+
+            result
+        }
+    }
+
+    unsafe fn print_to_hdc(hdc: HDC, document: &Document, title: &str) -> Result<PrintOutcome> {
+        let title_wide = wide_null(title);
+        let doc_info = DocInfoW {
+            cb_size: size_of::<DocInfoW>() as i32,
+            doc_name: title_wide.as_ptr(),
+            output: null(),
+            datatype: null(),
+            fw_type: 0,
+        };
+
+        if StartDocW(hdc, &doc_info) <= 0 {
+            return Err(BlitzError::Window("StartDocW failed".to_owned()));
+        }
+
+        let print_result = print_pages(hdc, document);
+        match print_result {
+            Ok(()) => {
+                if EndDoc(hdc) <= 0 {
+                    Err(BlitzError::Window("EndDoc failed".to_owned()))
+                } else {
+                    Ok(PrintOutcome::Submitted)
+                }
+            }
+            Err(error) => {
+                AbortDoc(hdc);
+                Err(error)
+            }
+        }
+    }
+
+    unsafe fn print_pages(hdc: HDC, document: &Document) -> Result<()> {
+        SetMapMode(hdc, MM_TEXT as i32);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, 0x00000000);
+
+        let log_pixels_x = GetDeviceCaps(hdc, LOGPIXELSX as i32).max(96);
+        let log_pixels_y = GetDeviceCaps(hdc, LOGPIXELSY as i32).max(96);
+        let page_width = GetDeviceCaps(hdc, HORZRES as i32).max(log_pixels_x);
+        let page_height = GetDeviceCaps(hdc, VERTRES as i32).max(log_pixels_y);
+        let margin_x = log_pixels_x / 2;
+        let margin_y = log_pixels_y / 2;
+        let left = margin_x;
+        let right = (page_width - margin_x).max(left + 1);
+        let top = margin_y;
+        let bottom = (page_height - margin_y).max(top + 1);
+
+        let face = wide_null("Consolas");
+        let font_height = -((PRINT_POINT_SIZE * log_pixels_y) / 72).max(1);
+        let font = CreateFontW(
+            font_height,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            DEFAULT_QUALITY as u32,
+            (FIXED_PITCH | FF_MODERN) as u32,
+            face.as_ptr(),
+        );
+        let old_font = if font.is_null() {
+            std::ptr::null_mut()
+        } else {
+            SelectObject(hdc, font)
+        };
+
+        let mut metrics: TEXTMETRICW = zeroed();
+        let line_height = if GetTextMetricsW(hdc, &mut metrics) != 0 {
+            (metrics.tmHeight + metrics.tmExternalLeading).max(1)
+        } else {
+            (log_pixels_y / 6).max(1)
+        };
+
+        let result = {
+            let mut y = top;
+            let mut page_open = false;
+            let result = (|| -> Result<()> {
+                start_print_page(hdc)?;
+                page_open = true;
+
+                visit_print_lines(document, |line| {
+                    unsafe {
+                        if y + line_height > bottom {
+                            end_print_page(hdc)?;
+                            page_open = false;
+                            start_print_page(hdc)?;
+                            page_open = true;
+                            y = top;
+                        }
+
+                        if !line.is_empty() {
+                            let line_wide = wide(line);
+                            let mut rect = RECT {
+                                left,
+                                top: y,
+                                right,
+                                bottom: (y + line_height).min(bottom),
+                            };
+                            if DrawTextW(
+                                hdc,
+                                line_wide.as_ptr(),
+                                line_wide.len() as i32,
+                                &mut rect,
+                                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_EXPANDTABS | DT_NOPREFIX,
+                            ) == 0
+                            {
+                                return Err(BlitzError::Window("DrawTextW failed".to_owned()));
+                            }
+                        }
+                        y += line_height;
+                    }
+                    Ok(())
+                })?;
+
+                if page_open {
+                    end_print_page(hdc)?;
+                    page_open = false;
+                }
+                Ok(())
+            })();
+            result
+        };
+        restore_font(hdc, old_font, font);
+        result
+    }
+
+    unsafe fn start_print_page(hdc: HDC) -> Result<()> {
+        if StartPage(hdc) <= 0 {
+            Err(BlitzError::Window("StartPage failed".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn end_print_page(hdc: HDC) -> Result<()> {
+        if EndPage(hdc) <= 0 {
+            Err(BlitzError::Window("EndPage failed".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn restore_font(hdc: HDC, old_font: HGDIOBJ, font: HFONT) {
+        if !old_font.is_null() {
+            SelectObject(hdc, old_font);
+        }
+        if !font.is_null() {
+            DeleteObject(font);
+        }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn wide_null(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 }
 
@@ -2004,6 +2638,14 @@ fn clipboard_text(clipboard_cache: &str) -> String {
         .and_then(|mut clipboard| clipboard.get_text().ok())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| clipboard_cache.to_owned())
+}
+
+fn clipboard_has_text(clipboard_cache: &str) -> bool {
+    !clipboard_cache.is_empty()
+        || Clipboard::new()
+            .ok()
+            .and_then(|mut clipboard| clipboard.get_text().ok())
+            .is_some_and(|text| !text.is_empty())
 }
 
 fn paste_into_find_query(query: &mut String, clipboard_cache: &mut String) {
@@ -2103,9 +2745,6 @@ fn render_frame_with_state(
     if let Some(menu_index) = gui_state.active_menu {
         draw_menu_popup(&mut canvas, app, menu_index, &gui_state.fonts);
     }
-    if let Some(dialog) = &gui_state.dialog {
-        draw_dialog(&mut canvas, dialog, &gui_state.fonts);
-    }
     Ok(canvas.into_frame())
 }
 
@@ -2146,7 +2785,7 @@ fn draw_chrome(canvas: &mut Canvas, state: &NotepadUiState, gui_state: &GuiState
         canvas.line(0, status_y, canvas.width, status_y, COLOR_BORDER);
 
         let mut x = 10usize;
-        for cell in state.status_cells() {
+        for cell in status_bar_cells(state, gui_state) {
             if x > 10 {
                 canvas.line(
                     x.saturating_sub(12),
@@ -2170,6 +2809,17 @@ fn draw_chrome(canvas: &mut Canvas, state: &NotepadUiState, gui_state: &GuiState
             }
         }
     }
+}
+
+fn status_bar_cells(state: &NotepadUiState, gui_state: &GuiState) -> Vec<String> {
+    let mut cells = state.status_cells();
+    if let Some(message) = gui_state
+        .status_text()
+        .filter(|message| !message.is_empty())
+    {
+        cells.insert(0, message.to_owned());
+    }
+    cells
 }
 
 fn draw_menu_popup(canvas: &mut Canvas, app: &BlitzApp, menu_index: usize, fonts: &FontStack) {
@@ -4061,6 +4711,46 @@ mod tests {
     }
 
     #[test]
+    fn frame_signature_tracks_status_message_changes() {
+        let app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let initial = frame_signature(&app, &state, 640, 400, &gui_state);
+
+        gui_state.set_message("Printing...");
+        let updated = frame_signature(&app, &state, 640, 400, &gui_state);
+
+        assert_ne!(initial, updated);
+    }
+
+    #[test]
+    fn frame_signature_ignores_status_message_when_status_bar_hidden() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        app.toggle_status_bar();
+        let state = app.ui_state().expect("ui state");
+        let initial = frame_signature(&app, &state, 640, 400, &gui_state);
+
+        gui_state.set_message("Printing...");
+        let updated = frame_signature(&app, &state, 640, 400, &gui_state);
+
+        assert_eq!(initial, updated);
+    }
+
+    #[test]
+    fn status_bar_cells_show_printing_while_print_job_is_active() {
+        let app = BlitzApp::new(EditorSettings::default());
+        let mut gui_state = GuiState::new().expect("gui state");
+        let (_sender, receiver) = mpsc::channel();
+        gui_state.print_job = Some(PrintJob { receiver });
+        gui_state.set_message("Some older status");
+
+        let cells = status_bar_cells(&app.ui_state().expect("ui state"), &gui_state);
+
+        assert_eq!(cells.first().map(String::as_str), Some("Printing..."));
+    }
+
+    #[test]
     fn startup_screenshot_is_written_as_png() {
         let app = BlitzApp::new(EditorSettings::default());
         let directory = tempfile::tempdir().expect("tempdir");
@@ -4071,6 +4761,81 @@ mod tests {
 
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(bytes.len() > 1024);
+    }
+
+    #[test]
+    fn print_request_snapshots_clean_existing_file_contents() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("print.txt");
+        std::fs::write(&path, "print me").expect("write");
+        let app = BlitzApp::open(&path, EditorSettings::default()).expect("open");
+
+        let request = print_request_for_app(&app).expect("print request");
+
+        assert_eq!(request.title, "print.txt");
+        assert_eq!(request.document.text_lossy(), "print me");
+    }
+
+    #[test]
+    fn print_request_snapshots_dirty_or_untitled_documents() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("unsaved print").expect("insert");
+
+        let request = print_request_for_app(&app).expect("print request");
+
+        assert_eq!(request.title, "Untitled");
+        assert_eq!(request.document.text_lossy(), "unsaved print");
+    }
+
+    #[test]
+    fn print_request_uses_lightweight_snapshot_for_large_documents() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text(&"x".repeat(PRINT_LINE_CHUNK_BYTES + 1))
+            .expect("insert");
+
+        let request = print_request_for_app(&app).expect("print request");
+
+        assert_eq!(request.document.len(), PRINT_LINE_CHUNK_BYTES + 1);
+        assert!(!request.document.can_undo());
+    }
+
+    #[test]
+    fn print_line_visitor_splits_crlf_lines_and_long_rows() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("a\r\nb\n").expect("insert");
+        app.insert_text(&"x".repeat(PRINT_LINE_CHUNK_BYTES + 1))
+            .expect("long insert");
+        let mut lines = Vec::new();
+
+        visit_print_lines(app.document(), |line| {
+            lines.push(line.to_owned());
+            Ok(())
+        })
+        .expect("visit lines");
+
+        assert_eq!(lines[0], "a");
+        assert_eq!(lines[1], "b");
+        assert!(lines
+            .iter()
+            .any(|line| line.len() == PRINT_LINE_CHUNK_BYTES));
+    }
+
+    #[test]
+    fn print_line_visitor_keeps_utf8_scalars_intact_when_splitting_long_rows() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text(&"x".repeat(PRINT_LINE_CHUNK_BYTES - 1))
+            .expect("insert prefix");
+        app.insert_text("😀tail").expect("insert emoji");
+        let mut lines = Vec::new();
+
+        visit_print_lines(app.document(), |line| {
+            lines.push(line.to_owned());
+            Ok(())
+        })
+        .expect("visit lines");
+
+        assert!(lines.iter().any(|line| line.contains("😀tail")));
+        assert!(lines.iter().all(|line| !line.contains('\u{fffd}')));
     }
 
     #[test]
@@ -4189,6 +4954,29 @@ mod tests {
 
         assert_eq!(query, "prefix 日本語 search");
         assert_eq!(clipboard_cache, "日本語 search");
+    }
+
+    #[test]
+    fn paste_menu_enablement_uses_clipboard_cache() {
+        assert!(clipboard_has_text("cached text"));
+    }
+
+    #[test]
+    fn info_window_is_deferred_while_child_dialog_is_open() {
+        let info = DialogState::Info {
+            title: "Print".to_owned(),
+            message: "Print failed".to_owned(),
+        };
+        let replace = DialogState::Replace {
+            query: "needle".to_owned(),
+            replacement: "replacement".to_owned(),
+            active_field: ReplaceField::Find,
+            match_case: false,
+        };
+
+        assert!(should_defer_dialog_window(&info, true));
+        assert!(!should_defer_dialog_window(&info, false));
+        assert!(!should_defer_dialog_window(&replace, true));
     }
 
     #[test]
@@ -4382,16 +5170,24 @@ mod tests {
     #[test]
     fn replace_dialog_can_replace_all() {
         let mut app = BlitzApp::new(EditorSettings::default());
-        let mut gui_state = GuiState::new().expect("gui state");
         app.insert_text("one one").expect("insert");
-        gui_state.dialog = Some(DialogState::Replace {
+        let mut last_search = None;
+        let mut pending_reveal_selection = false;
+        let mut dialog = DialogState::Replace {
             query: "one".to_owned(),
             replacement: "two".to_owned(),
             active_field: ReplaceField::Find,
             match_case: true,
-        });
+        };
 
-        accept_dialog(&mut app, &mut gui_state, true).expect("replace all");
+        assert!(accept_dialog_state(
+            &mut app,
+            &mut last_search,
+            &mut pending_reveal_selection,
+            &mut dialog,
+            true,
+        )
+        .expect("replace all"));
         assert_eq!(app.document().text_lossy(), "two two");
     }
 

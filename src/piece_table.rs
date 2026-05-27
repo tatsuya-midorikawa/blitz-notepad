@@ -69,7 +69,7 @@ struct Piece {
 #[derive(Clone, Debug)]
 pub struct PieceTable {
     original: SourceBytes,
-    add: Vec<u8>,
+    add: Arc<Vec<u8>>,
     pieces: Vec<Piece>,
     len: usize,
 }
@@ -109,7 +109,7 @@ impl PieceTable {
 
         Ok(Self {
             original,
-            add: Vec::new(),
+            add: Arc::new(Vec::new()),
             pieces,
             len,
         })
@@ -250,8 +250,9 @@ impl PieceTable {
             return Ok(());
         }
 
-        let add_start = self.add.len();
-        self.add.extend_from_slice(text.as_bytes());
+        let add = Arc::make_mut(&mut self.add);
+        let add_start = add.len();
+        add.extend_from_slice(text.as_bytes());
         let inserted_piece = Piece {
             source: BufferKind::Add,
             start: add_start,
@@ -337,7 +338,7 @@ impl PieceTable {
     fn piece_bytes(&self, piece: &Piece) -> &[u8] {
         let source = match piece.source {
             BufferKind::Original => self.original.as_slice(),
-            BufferKind::Add => &self.add,
+            BufferKind::Add => self.add.as_slice(),
         };
         &source[piece.start..piece.start + piece.len]
     }

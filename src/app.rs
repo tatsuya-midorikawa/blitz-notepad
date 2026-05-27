@@ -397,7 +397,7 @@ impl BlitzApp {
 
     pub(crate) fn save_snapshot(&self) -> Option<SaveSnapshot> {
         Some(SaveSnapshot {
-            document: self.document.clone(),
+            document: self.document.snapshot_clone(),
             path: self.document.path()?.to_path_buf(),
             encoding: self.document.encoding(),
             line_ending: self.document.line_ending(),

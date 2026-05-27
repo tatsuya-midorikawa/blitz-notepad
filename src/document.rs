@@ -210,6 +210,23 @@ impl Document {
         self.buffer.collect_bytes()
     }
 
+    pub(crate) fn snapshot_clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            buffer: self.buffer.clone(),
+            line_index: RefCell::new(LineIndex::build_prefix(&[], 0)),
+            pending_line_index: RefCell::new(None),
+            encoding: self.encoding,
+            line_ending: self.line_ending,
+            dirty: self.dirty,
+            load_mode: self.load_mode,
+            original_file_len: self.original_file_len,
+            change_generation: self.change_generation,
+            saved_generation: self.saved_generation,
+            undo_stack: Vec::new(),
+        }
+    }
+
     pub(crate) fn for_each_chunk<E>(
         &self,
         visit: impl FnMut(&[u8]) -> std::result::Result<(), E>,
@@ -1139,5 +1156,20 @@ mod tests {
 
         assert_eq!(document.line_start(1), Some(chunk_len + 1));
         assert_eq!(document.visible_lines(1, 1)[0].text, "b");
+    }
+
+    #[test]
+    fn snapshot_clone_is_stable_after_source_edits() {
+        let mut document = Document::new_untitled();
+        document.insert_text(0, "alpha").expect("insert");
+
+        let snapshot = document.snapshot_clone();
+        document
+            .insert_text(document.len(), " beta")
+            .expect("edit source");
+
+        assert_eq!(snapshot.text_lossy(), "alpha");
+        assert_eq!(document.text_lossy(), "alpha beta");
+        assert!(!snapshot.can_undo());
     }
 }
