@@ -159,7 +159,6 @@ fn file_menu() -> Vec<MenuItem> {
         MenuItem::command("Open...", Some("Ctrl+O")),
         MenuItem::command("Save", Some("Ctrl+S")),
         MenuItem::command("Save As...", Some("Ctrl+Shift+S")).separator_after(),
-        MenuItem::command("Page Setup...", None),
         MenuItem::command("Print...", Some("Ctrl+P")).separator_after(),
         MenuItem::command("Exit", None),
     ]

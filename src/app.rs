@@ -4,19 +4,15 @@ use std::path::{Path, PathBuf};
 
 use memchr::memmem::Finder;
 use memchr::{memchr, memchr2};
-use time::format_description::FormatItem;
-use time::macros::format_description;
 use time::OffsetDateTime;
 
+use crate::date_time::time_date_for_insert;
 use crate::document::TextEdit;
 use crate::encoding::TextEncoding;
 use crate::line_index::LineEnding;
 use crate::settings::EditorSettings;
 use crate::ui::{default_ui_state, NotepadUiState};
 use crate::{Document, Result};
-
-const DATE_TIME_FORMAT: &[FormatItem<'_>] =
-    format_description!("[hour]:[minute] [month]/[day]/[year]");
 
 #[derive(Clone, Debug)]
 pub struct BlitzApp {
@@ -447,9 +443,7 @@ impl BlitzApp {
 
     pub fn insert_time_date(&mut self) -> Result<()> {
         let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-        let formatted = now
-            .format(DATE_TIME_FORMAT)
-            .unwrap_or_else(|_| "00:00 1/1/1970".to_owned());
+        let formatted = time_date_for_insert(now);
         self.insert_text(&formatted)
     }
 
@@ -1113,6 +1107,23 @@ mod tests {
 
         assert_eq!(app.document().text_lossy(), "beta");
         assert_eq!(app.caret_offset(), "beta".len());
+    }
+
+    #[test]
+    fn time_date_inserts_text_at_caret() {
+        let mut app = BlitzApp::default();
+        app.insert_text("leftright").expect("insert");
+        app.set_caret_offset("left".len()).expect("caret");
+
+        app.insert_time_date().expect("time/date");
+
+        let text = app.document().text_lossy();
+        let inserted = text
+            .strip_prefix("left")
+            .and_then(|text| text.strip_suffix("right"))
+            .expect("inserted between existing text");
+        assert!(!inserted.is_empty());
+        assert_eq!(app.caret_offset(), "left".len() + inserted.len());
     }
 
     #[test]

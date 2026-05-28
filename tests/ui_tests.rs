@@ -114,10 +114,9 @@ fn title_and_status_reflect_save_zoom_and_visibility() {
 #[test]
 fn file_menu_text_and_shortcuts_match_reference() {
     let state = default_ui_state(&EditorSettings::default());
-    let labels = state
-        .menu("File")
-        .expect("file menu")
-        .into_iter()
+    let menu = state.menu("File").expect("file menu");
+    let labels = menu
+        .iter()
         .map(|item| (item.label, item.shortcut))
         .collect::<Vec<_>>();
 
@@ -129,11 +128,17 @@ fn file_menu_text_and_shortcuts_match_reference() {
             ("Open...", Some("Ctrl+O")),
             ("Save", Some("Ctrl+S")),
             ("Save As...", Some("Ctrl+Shift+S")),
-            ("Page Setup...", None),
             ("Print...", Some("Ctrl+P")),
             ("Exit", None),
         ]
     );
+
+    let separators = menu
+        .iter()
+        .filter(|item| item.separator_after)
+        .map(|item| item.label)
+        .collect::<Vec<_>>();
+    assert_eq!(separators, vec!["Save As...", "Print..."]);
 }
 
 #[test]

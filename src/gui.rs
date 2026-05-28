@@ -32,6 +32,8 @@ const DEFAULT_WIDTH: usize = 960;
 const DEFAULT_HEIGHT: usize = 640;
 const FIND_WINDOW_WIDTH: usize = 430;
 const FIND_WINDOW_HEIGHT: usize = 140;
+const GO_TO_WINDOW_WIDTH: usize = 250;
+const GO_TO_WINDOW_HEIGHT: usize = 100;
 const MIN_WIDTH: usize = 420;
 const MIN_HEIGHT: usize = 240;
 const MENU_HEIGHT: usize = 30;
@@ -60,11 +62,13 @@ const COLOR_BORDER: u32 = 0x00d4d4d4;
 const COLOR_MENU_OPEN: u32 = 0x00dbeeff;
 const COLOR_DROPDOWN: u32 = 0x00f8f8f8;
 const COLOR_BUTTON: u32 = 0x00e1e1e1;
+const COLOR_FOCUS_BORDER: u32 = 0x000078d7;
 const COLOR_GROUP_BOX: u32 = 0x00dddddd;
 const COLOR_SCROLLBAR: u32 = 0x00e6e6e6;
 const COLOR_SCROLL_THUMB: u32 = 0x00b8b8b8;
 const COLOR_SELECTION: u32 = 0x00cce8ff;
 const COLOR_TEXT: u32 = 0x00000000;
+const COLOR_SELECTED_TEXT: u32 = 0x00ffffff;
 const COLOR_DISABLED_TEXT: u32 = 0x00808080;
 const COLOR_CARET: u32 = 0x00000000;
 
@@ -484,6 +488,24 @@ const FIND_DIRECTION_GROUP_RECT: Rect = Rect {
     width: 140,
     height: 50,
 };
+const GO_TO_FIELD_RECT: Rect = Rect {
+    x: 10,
+    y: 29,
+    width: 228,
+    height: 23,
+};
+const GO_TO_ACCEPT_BUTTON_RECT: Rect = Rect {
+    x: 84,
+    y: 65,
+    width: 73,
+    height: 23,
+};
+const GO_TO_CANCEL_BUTTON_RECT: Rect = Rect {
+    x: 165,
+    y: 65,
+    width: 73,
+    height: 23,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FrameSignature {
@@ -538,6 +560,7 @@ struct DialogWindowState {
     window: Window,
     input_queue: Rc<RefCell<Vec<char>>>,
     state: DialogState,
+    mouse_was_down: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -550,6 +573,7 @@ enum DialogState {
     },
     GoTo {
         line: String,
+        replace_on_input: bool,
     },
     Info {
         title: String,
@@ -1176,6 +1200,7 @@ fn open_dialog_window(gui_state: &mut GuiState, state: DialogState) -> Result<()
         window,
         input_queue: Rc::clone(&input_queue),
         state,
+        mouse_was_down: false,
     });
     if let Some(dialog) = gui_state.dialog.as_mut() {
         dialog
@@ -1204,7 +1229,6 @@ fn dialog_window_title(state: &DialogState) -> &'static str {
         DialogState::Replace { .. } => "Replace",
         DialogState::GoTo { .. } => "Go To Line",
         DialogState::Info { title, .. } => match title.as_str() {
-            "Page Setup" => "Page Setup",
             "Print" => "Print",
             "Font" => "Font",
             "About Notepad" => "About Notepad",
@@ -1217,7 +1241,7 @@ fn dialog_window_title(state: &DialogState) -> &'static str {
 fn dialog_window_size(state: &DialogState) -> (usize, usize) {
     match state {
         DialogState::Replace { .. } => (470, 220),
-        DialogState::GoTo { .. } => (360, 180),
+        DialogState::GoTo { .. } => (GO_TO_WINDOW_WIDTH, GO_TO_WINDOW_HEIGHT),
         DialogState::Info { .. } => (470, 210),
     }
 }
@@ -1245,6 +1269,14 @@ fn handle_dialog_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<
     }
     if keep_open {
         handle_dialog_window_text_input(&mut dialog);
+    }
+    if keep_open {
+        keep_open = handle_dialog_window_mouse(
+            app,
+            &mut gui_state.last_search,
+            &mut gui_state.pending_reveal_selection,
+            &mut dialog,
+        )?;
     }
 
     if keep_open {
@@ -1290,6 +1322,14 @@ fn handle_dialog_window_keys(
             .window
             .is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
     {
+        if matches!(&dialog.state, DialogState::GoTo { .. }) {
+            return activate_go_to_button(
+                app,
+                last_search,
+                pending_reveal_selection,
+                &mut dialog.state,
+            );
+        }
         return accept_dialog_state(
             app,
             last_search,
@@ -1312,6 +1352,52 @@ fn handle_dialog_window_text_input(dialog: &mut DialogWindowState) {
             append_dialog_character(&mut dialog.state, character);
         }
     }
+}
+
+fn handle_dialog_window_mouse(
+    app: &mut BlitzApp,
+    last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
+    dialog: &mut DialogWindowState,
+) -> Result<bool> {
+    let mouse_down = dialog.window.get_mouse_down(MouseButton::Left);
+    let clicked = mouse_down && !dialog.mouse_was_down;
+    dialog.mouse_was_down = mouse_down;
+    if !clicked {
+        return Ok(true);
+    }
+
+    let Some((mouse_x, mouse_y)) = dialog.window.get_mouse_pos(MouseMode::Discard) else {
+        return Ok(true);
+    };
+    let x = mouse_x as usize;
+    let y = mouse_y as usize;
+
+    if !matches!(&dialog.state, DialogState::GoTo { .. }) {
+        return Ok(true);
+    }
+
+    if hit_rect(x, y, GO_TO_ACCEPT_BUTTON_RECT) {
+        activate_go_to_button(
+            app,
+            last_search,
+            pending_reveal_selection,
+            &mut dialog.state,
+        )
+    } else if hit_rect(x, y, GO_TO_CANCEL_BUTTON_RECT) {
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
+fn activate_go_to_button(
+    app: &mut BlitzApp,
+    last_search: &mut Option<SearchSpec>,
+    pending_reveal_selection: &mut bool,
+    dialog: &mut DialogState,
+) -> Result<bool> {
+    accept_dialog_state(app, last_search, pending_reveal_selection, dialog, false)
 }
 
 fn render_dialog_window(dialog: &DialogState, fonts: &FontStack) -> RenderFrame {
@@ -1380,7 +1466,7 @@ fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str) {
         FIND_FIELD_RECT.y,
         FIND_FIELD_RECT.width,
         FIND_FIELD_RECT.height,
-        0x000078d7,
+        COLOR_FOCUS_BORDER,
     );
     let visible = text_prefix_for_width(
         fonts,
@@ -1404,6 +1490,99 @@ fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str) {
         2,
         FIND_FIELD_RECT.height - 8,
         COLOR_CARET,
+    );
+}
+
+fn draw_go_to_dialog(canvas: &mut Canvas, fonts: &FontStack, line: &str, selected: bool) {
+    canvas.text(10, 10, "Line number:", COLOR_TEXT, TextRole::Find, fonts);
+    draw_go_to_text_field(canvas, fonts, line, selected);
+    draw_go_to_button(canvas, fonts, GO_TO_ACCEPT_BUTTON_RECT, "Go To", true);
+    draw_go_to_button(canvas, fonts, GO_TO_CANCEL_BUTTON_RECT, "Cancel", false);
+}
+
+fn draw_go_to_text_field(canvas: &mut Canvas, fonts: &FontStack, line: &str, selected: bool) {
+    canvas.fill_rect(
+        GO_TO_FIELD_RECT.x,
+        GO_TO_FIELD_RECT.y,
+        GO_TO_FIELD_RECT.width,
+        GO_TO_FIELD_RECT.height,
+        COLOR_TEXT_AREA,
+    );
+    canvas.rect(
+        GO_TO_FIELD_RECT.x,
+        GO_TO_FIELD_RECT.y,
+        GO_TO_FIELD_RECT.width,
+        GO_TO_FIELD_RECT.height,
+        COLOR_FOCUS_BORDER,
+    );
+    let visible = text_prefix_for_width(
+        fonts,
+        line,
+        TextRole::Find,
+        GO_TO_FIELD_RECT.width.saturating_sub(12),
+    );
+    let text_x = GO_TO_FIELD_RECT.x + 5;
+    let text_y = centered_text_y(GO_TO_FIELD_RECT, TextRole::Find);
+    let text_color = if selected && !visible.is_empty() {
+        let selection_width = fonts
+            .measure(visible, TextRole::Find)
+            .min(GO_TO_FIELD_RECT.width.saturating_sub(10));
+        canvas.fill_rect(
+            text_x,
+            GO_TO_FIELD_RECT.y + 3,
+            selection_width.max(1),
+            GO_TO_FIELD_RECT.height - 6,
+            COLOR_FOCUS_BORDER,
+        );
+        COLOR_SELECTED_TEXT
+    } else {
+        COLOR_TEXT
+    };
+    canvas.text(text_x, text_y, visible, text_color, TextRole::Find, fonts);
+    if !selected {
+        let caret_x = (text_x + fonts.measure(visible, TextRole::Find))
+            .min(GO_TO_FIELD_RECT.x + GO_TO_FIELD_RECT.width - 4);
+        canvas.fill_rect(
+            caret_x,
+            GO_TO_FIELD_RECT.y + 4,
+            1,
+            GO_TO_FIELD_RECT.height - 8,
+            COLOR_CARET,
+        );
+    }
+}
+
+fn draw_go_to_button(
+    canvas: &mut Canvas,
+    fonts: &FontStack,
+    rect: Rect,
+    label: &str,
+    default_button: bool,
+) {
+    if default_button {
+        canvas.rect(
+            rect.x - 1,
+            rect.y - 1,
+            rect.width + 2,
+            rect.height + 2,
+            COLOR_FOCUS_BORDER,
+        );
+    }
+    canvas.fill_rect(rect.x, rect.y, rect.width, rect.height, COLOR_BUTTON);
+    canvas.rect(rect.x, rect.y, rect.width, rect.height, COLOR_BORDER);
+    let label = text_prefix_for_width(fonts, label, TextRole::Find, rect.width.saturating_sub(8));
+    let text_x = rect.x
+        + rect
+            .width
+            .saturating_sub(fonts.measure(label, TextRole::Find))
+            / 2;
+    canvas.text(
+        text_x,
+        centered_text_y(rect, TextRole::Find),
+        label,
+        COLOR_TEXT,
+        TextRole::Find,
+        fonts,
     );
 }
 
@@ -1622,12 +1801,7 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
             )?;
         }
         if window.is_key_pressed(Key::G, KeyRepeat::No) && !app.settings().word_wrap {
-            open_dialog_window(
-                gui_state,
-                DialogState::GoTo {
-                    line: String::new(),
-                },
-            )?;
+            open_go_to_dialog(app, gui_state)?;
         }
         if window.is_key_pressed(Key::E, KeyRepeat::No) {
             search_with_bing(app, gui_state);
@@ -1788,7 +1962,16 @@ fn append_dialog_character(dialog: &mut DialogState, character: char) {
             ReplaceField::Find => query.push(character),
             ReplaceField::Replace => replacement.push(character),
         },
-        DialogState::GoTo { line } if character.is_ascii_digit() => line.push(character),
+        DialogState::GoTo {
+            line,
+            replace_on_input,
+        } if character.is_ascii_digit() => {
+            if *replace_on_input {
+                line.clear();
+                *replace_on_input = false;
+            }
+            line.push(character);
+        }
         _ => {}
     }
 }
@@ -1808,8 +1991,16 @@ fn backspace_dialog_field(dialog: &mut DialogState) {
                 replacement.pop();
             }
         },
-        DialogState::GoTo { line } => {
-            line.pop();
+        DialogState::GoTo {
+            line,
+            replace_on_input,
+        } => {
+            if *replace_on_input {
+                line.clear();
+                *replace_on_input = false;
+            } else {
+                line.pop();
+            }
         }
         _ => {}
     }
@@ -1846,11 +2037,22 @@ fn paste_into_dialog_field(dialog: &mut DialogState, clipboard_cache: &mut Strin
             ReplaceField::Find => query.push_str(&pasted),
             ReplaceField::Replace => replacement.push_str(&pasted),
         },
-        DialogState::GoTo { line } => line.extend(
-            pasted
+        DialogState::GoTo {
+            line,
+            replace_on_input,
+        } => {
+            let digits = pasted
                 .chars()
-                .filter(|character| character.is_ascii_digit()),
-        ),
+                .filter(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if !digits.is_empty() {
+                if *replace_on_input {
+                    line.clear();
+                    *replace_on_input = false;
+                }
+                line.push_str(&digits);
+            }
+        }
         DialogState::Info { .. } => {}
     }
     *clipboard_cache = pasted;
@@ -1883,7 +2085,7 @@ fn accept_dialog_state(
             }
             Ok(true)
         }
-        DialogState::GoTo { line } => {
+        DialogState::GoTo { line, .. } => {
             let parsed = line.parse::<usize>().unwrap_or(0);
             if app.go_to_line(parsed)? {
                 Ok(false)
@@ -1930,13 +2132,6 @@ fn execute_menu_row(
             save_document_or_dialog(app, gui_state)?;
         }
         ("File", "Save As...") => save_as_dialog(app, gui_state)?,
-        ("File", "Page Setup...") => {
-            open_info_window(
-                gui_state,
-                "Page Setup",
-                "Page setup options are not persisted yet. Header, footer, margins, and orientation will be added to the print pipeline.",
-            )?;
-        }
         ("File", "Print...") => {
             start_background_print(app, gui_state)?;
         }
@@ -2006,12 +2201,7 @@ fn execute_menu_row(
             )?;
         }
         ("Edit", "Go To...") => {
-            open_dialog_window(
-                gui_state,
-                DialogState::GoTo {
-                    line: String::new(),
-                },
-            )?;
+            open_go_to_dialog(app, gui_state)?;
         }
         ("Format", "Word Wrap") => app.toggle_word_wrap(),
         ("Format", "Font...") => {
@@ -2890,11 +3080,20 @@ fn draw_menu_popup(canvas: &mut Canvas, app: &BlitzApp, menu_index: usize, fonts
 }
 
 fn draw_dialog(canvas: &mut Canvas, dialog: &DialogState, fonts: &FontStack) {
+    if let DialogState::GoTo {
+        line,
+        replace_on_input,
+    } = dialog
+    {
+        draw_go_to_dialog(canvas, fonts, line, *replace_on_input);
+        return;
+    }
+
     let width = 430usize.min(canvas.width.saturating_sub(40));
     let height = match dialog {
         DialogState::Replace { .. } => 180,
         DialogState::Info { .. } => 160,
-        DialogState::GoTo { .. } => 140,
+        DialogState::GoTo { .. } => unreachable!(),
     };
     let x = (canvas.width.saturating_sub(width)) / 2;
     let y = (canvas.height.saturating_sub(height)) / 2;
@@ -2962,25 +3161,7 @@ fn draw_dialog(canvas: &mut Canvas, dialog: &DialogState, fonts: &FontStack) {
                 fonts,
             );
         }
-        DialogState::GoTo { line } => {
-            canvas.text(
-                x + 16,
-                y + 12,
-                "Go To Line",
-                COLOR_TEXT,
-                TextRole::Ui,
-                fonts,
-            );
-            draw_text_field(canvas, fonts, x + 16, y + 44, width - 32, line, true);
-            canvas.text(
-                x + 16,
-                y + 86,
-                "Enter: Go To   Esc: Close",
-                COLOR_TEXT,
-                TextRole::Ui,
-                fonts,
-            );
-        }
+        DialogState::GoTo { .. } => unreachable!(),
         DialogState::Info { title, message } => {
             canvas.text(x + 16, y + 12, title, COLOR_TEXT, TextRole::Ui, fonts);
             for (index, line) in message.lines().take(4).enumerate() {
@@ -3023,6 +3204,20 @@ fn draw_text_field(
         if active { COLOR_TEXT } else { COLOR_BORDER },
     );
     canvas.text(x + 6, y + 6, text, COLOR_TEXT, TextRole::Ui, fonts);
+}
+
+fn go_to_dialog_line(app: &BlitzApp) -> Result<String> {
+    Ok(app.ui_state()?.caret_line.to_string())
+}
+
+fn open_go_to_dialog(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+    open_dialog_window(
+        gui_state,
+        DialogState::GoTo {
+            line: go_to_dialog_line(app)?,
+            replace_on_input: true,
+        },
+    )
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -4915,7 +5110,7 @@ mod tests {
         assert!(FIND_UP_RADIO_RECT.x + FIND_UP_RADIO_RECT.width <= FIND_DOWN_RADIO_RECT.x);
         assert_eq!(
             frame.pixels[pixel_index(&frame, FIND_FIELD_RECT.x, FIND_FIELD_RECT.y)],
-            0x000078d7
+            COLOR_FOCUS_BORDER
         );
         assert_eq!(
             frame.pixels[pixel_index(
@@ -4933,6 +5128,122 @@ mod tests {
             )],
             COLOR_TEXT_AREA
         );
+    }
+
+    #[test]
+    fn go_to_dialog_view_matches_reference_layout() {
+        let fonts = FontStack::load().expect("fonts");
+        let dialog = DialogState::GoTo {
+            line: "1".to_owned(),
+            replace_on_input: true,
+        };
+
+        let frame = render_dialog_window(&dialog, &fonts);
+
+        assert_eq!(frame.width, GO_TO_WINDOW_WIDTH);
+        assert_eq!(frame.height, GO_TO_WINDOW_HEIGHT);
+        assert_eq!(frame.pixels[pixel_index(&frame, 0, 0)], COLOR_WINDOW);
+        assert_eq!(
+            frame.pixels[pixel_index(&frame, GO_TO_FIELD_RECT.x, GO_TO_FIELD_RECT.y)],
+            COLOR_FOCUS_BORDER
+        );
+        assert_eq!(
+            frame.pixels[pixel_index(&frame, GO_TO_FIELD_RECT.x + 1, GO_TO_FIELD_RECT.y + 1)],
+            COLOR_TEXT_AREA
+        );
+        let mut selected_pixels = 0;
+        for y in GO_TO_FIELD_RECT.y + 3..GO_TO_FIELD_RECT.y + GO_TO_FIELD_RECT.height - 3 {
+            for x in GO_TO_FIELD_RECT.x + 5..GO_TO_FIELD_RECT.x + 20 {
+                if frame.pixels[pixel_index(&frame, x, y)] == COLOR_FOCUS_BORDER {
+                    selected_pixels += 1;
+                }
+            }
+        }
+        assert!(selected_pixels > 0);
+        assert_eq!(
+            frame.pixels[pixel_index(
+                &frame,
+                GO_TO_ACCEPT_BUTTON_RECT.x - 1,
+                GO_TO_ACCEPT_BUTTON_RECT.y - 1
+            )],
+            COLOR_FOCUS_BORDER
+        );
+        assert_eq!(
+            frame.pixels[pixel_index(
+                &frame,
+                GO_TO_ACCEPT_BUTTON_RECT.x + 2,
+                GO_TO_ACCEPT_BUTTON_RECT.y + 2
+            )],
+            COLOR_BUTTON
+        );
+        assert_eq!(
+            frame.pixels[pixel_index(
+                &frame,
+                GO_TO_CANCEL_BUTTON_RECT.x + 2,
+                GO_TO_CANCEL_BUTTON_RECT.y + 2
+            )],
+            COLOR_BUTTON
+        );
+        assert!(fonts.measure("Go To", TextRole::Find) <= GO_TO_ACCEPT_BUTTON_RECT.width - 8);
+        assert!(fonts.measure("Cancel", TextRole::Find) <= GO_TO_CANCEL_BUTTON_RECT.width - 8);
+        assert!(GO_TO_FIELD_RECT.y + GO_TO_FIELD_RECT.height < GO_TO_ACCEPT_BUTTON_RECT.y);
+        assert!(
+            GO_TO_ACCEPT_BUTTON_RECT.x + GO_TO_ACCEPT_BUTTON_RECT.width
+                < GO_TO_CANCEL_BUTTON_RECT.x
+        );
+    }
+
+    #[test]
+    fn go_to_dialog_line_uses_current_caret_line() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("one\ntwo\nthree").expect("insert");
+        app.set_caret_offset("one\nt".len()).expect("caret");
+
+        assert_eq!(go_to_dialog_line(&app).expect("line"), "2");
+    }
+
+    #[test]
+    fn go_to_dialog_replaces_initial_line_number_on_first_digit() {
+        let mut dialog = DialogState::GoTo {
+            line: "1".to_owned(),
+            replace_on_input: true,
+        };
+
+        append_dialog_character(&mut dialog, '2');
+        append_dialog_character(&mut dialog, '5');
+
+        assert_eq!(
+            dialog,
+            DialogState::GoTo {
+                line: "25".to_owned(),
+                replace_on_input: false,
+            }
+        );
+    }
+
+    #[test]
+    fn go_to_button_action_moves_caret_and_closes_dialog() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("one\ntwo\nthree").expect("insert");
+        let mut last_search = None;
+        let mut pending_reveal_selection = false;
+        let mut dialog = DialogState::GoTo {
+            line: "2".to_owned(),
+            replace_on_input: false,
+        };
+
+        let keep_open = activate_go_to_button(
+            &mut app,
+            &mut last_search,
+            &mut pending_reveal_selection,
+            &mut dialog,
+        )
+        .expect("go to action");
+
+        assert!(!keep_open);
+        assert_eq!(app.ui_state().expect("ui").caret_line, 2);
+        assert!(last_search.is_none());
+        assert!(!pending_reveal_selection);
     }
 
     #[test]
