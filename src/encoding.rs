@@ -8,6 +8,8 @@ use crate::{BlitzError, Result};
 pub const UTF8_CHECK_LIMIT: usize = 4_096;
 pub const ENCODING_DETECTION_LIMIT: usize = 65_536;
 
+const UTF8_PROBE_TAIL_BYTES: usize = 3;
+
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 const UTF16_LE_BOM: &[u8] = b"\xFF\xFE";
 const UTF16_BE_BOM: &[u8] = b"\xFE\xFF";
@@ -67,12 +69,27 @@ pub fn detect_encoding(bytes: &[u8]) -> TextEncoding {
         return TextEncoding::Utf16Be;
     }
 
-    let utf8_sample = &bytes[..bytes.len().min(UTF8_CHECK_LIMIT)];
-    if std::str::from_utf8(utf8_sample).is_ok() {
+    if looks_like_utf8(bytes) {
         return TextEncoding::Utf8;
     }
 
     TextEncoding::Ansi
+}
+
+fn looks_like_utf8(bytes: &[u8]) -> bool {
+    let sample_len = bytes.len().min(UTF8_CHECK_LIMIT);
+    let probe_len = bytes.len().min(sample_len + UTF8_PROBE_TAIL_BYTES);
+    let sample = &bytes[..probe_len];
+
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(error) => {
+            // A fixed-size probe can stop in the middle of a UTF-8 scalar in large files.
+            probe_len < bytes.len()
+                && error.error_len().is_none()
+                && error.valid_up_to() >= sample_len.saturating_sub(UTF8_PROBE_TAIL_BYTES)
+        }
+    }
 }
 
 pub fn decode_to_utf8(bytes: &[u8], encoding: TextEncoding) -> Result<String> {
@@ -197,6 +214,41 @@ mod tests {
     fn detects_utf16_without_bom() {
         let bytes = [b'a', 0, b'b', 0, b'c', 0, b'\n', 0];
         assert_eq!(detect_encoding(&bytes), TextEncoding::Utf16Le);
+    }
+
+    #[test]
+    fn detects_utf8_when_sample_ends_inside_multibyte_scalar() {
+        let mut bytes = vec![b'a'; UTF8_CHECK_LIMIT - 1];
+        bytes.extend_from_slice("😀".as_bytes());
+        bytes.extend_from_slice(b"\n");
+
+        assert_eq!(detect_encoding(&bytes), TextEncoding::Utf8);
+    }
+
+    #[test]
+    fn detects_utf8_when_file_ends_at_check_limit() {
+        let bytes = vec![b'a'; UTF8_CHECK_LIMIT];
+
+        assert_eq!(detect_encoding(&bytes), TextEncoding::Utf8);
+    }
+
+    #[test]
+    fn keeps_ansi_when_invalid_utf8_appears_before_probe_tail() {
+        let mut bytes = vec![b'a'; UTF8_CHECK_LIMIT - UTF8_PROBE_TAIL_BYTES - 1];
+        bytes.push(0x81);
+        bytes.extend_from_slice(b"abcd");
+
+        assert_eq!(detect_encoding(&bytes), TextEncoding::Ansi);
+    }
+
+    #[test]
+    fn keeps_shift_jis_when_sample_ends_at_encoded_japanese() {
+        let mut bytes = vec![b'a'; UTF8_CHECK_LIMIT - 1];
+        bytes.extend_from_slice(
+            &encode_from_utf8("あ", TextEncoding::Ansi).expect("encode Shift_JIS"),
+        );
+
+        assert_eq!(detect_encoding(&bytes), TextEncoding::Ansi);
     }
 
     #[test]

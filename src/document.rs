@@ -996,11 +996,7 @@ fn spawn_full_line_index(
         .name("blitz-line-index".to_owned())
         .spawn(move || {
             let body = &source.as_slice()[body_start..body_start + body_len];
-            let mut line_index = LineIndex::build_prefix(body, INITIAL_MMAP_LINE_INDEX_BYTES);
-            while !line_index.is_complete() {
-                line_index.extend(body, INITIAL_MMAP_LINE_INDEX_BYTES);
-                thread::yield_now();
-            }
+            let line_index = LineIndex::build_parallel(body);
             if let Ok(mut completed) = worker_pending.lock() {
                 *completed = Some(line_index);
             }

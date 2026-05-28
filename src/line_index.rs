@@ -1,9 +1,12 @@
 use std::ops::Range;
+use std::thread;
 
 use memchr::memchr2_iter;
 use serde::{Deserialize, Serialize};
 
 const LINE_ENDING_SAMPLE_LIMIT: usize = 4_096;
+const PARALLEL_LINE_INDEX_MIN_BYTES: usize = 64 * 1024 * 1024;
+const PARALLEL_LINE_INDEX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LineEnding {
@@ -48,6 +51,23 @@ impl LineIndex {
             indexed_len: bytes.len(),
             complete: true,
         }
+    }
+
+    pub fn build_parallel(bytes: &[u8]) -> Self {
+        if bytes.len() < PARALLEL_LINE_INDEX_MIN_BYTES {
+            return Self::build(bytes);
+        }
+
+        let available_workers = thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        let target_workers = bytes.len().div_ceil(PARALLEL_LINE_INDEX_CHUNK_BYTES);
+        let worker_count = available_workers.min(target_workers).max(1);
+        if worker_count <= 1 {
+            return Self::build(bytes);
+        }
+
+        build_parallel_with_chunk_len(bytes, bytes.len().div_ceil(worker_count))
     }
 
     pub fn build_prefix(bytes: &[u8], max_indexed_len: usize) -> Self {
@@ -184,21 +204,88 @@ fn safe_prefix_len(bytes: &[u8], requested_len: usize) -> usize {
 fn newline_starts(base_offset: usize, bytes: &[u8]) -> Vec<usize> {
     let mut starts = Vec::new();
     let mut skip_lf_at = None;
-    for newline_index in memchr2_iter(b'\r', b'\n', bytes) {
-        if skip_lf_at == Some(newline_index) {
-            skip_lf_at = None;
+    append_newline_starts(
+        &mut starts,
+        base_offset,
+        bytes,
+        memchr2_iter(b'\r', b'\n', bytes).map(|index| base_offset + index),
+        &mut skip_lf_at,
+    );
+    starts
+}
+
+fn build_parallel_with_chunk_len(bytes: &[u8], chunk_len: usize) -> LineIndex {
+    if bytes.is_empty() || chunk_len == 0 || chunk_len >= bytes.len() {
+        return LineIndex::build(bytes);
+    }
+
+    let ranges = (0..bytes.len())
+        .step_by(chunk_len)
+        .map(|start| start..(start + chunk_len).min(bytes.len()))
+        .collect::<Vec<_>>();
+    let scan_results = thread::scope(|scope| {
+        let handles = ranges
+            .iter()
+            .cloned()
+            .map(|range| scope.spawn(move || newline_positions(range.start, &bytes[range])))
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(positions) => results.push(positions),
+                Err(_) => return None,
+            }
+        }
+        Some(results)
+    });
+    let Some(position_chunks) = scan_results else {
+        return LineIndex::build(bytes);
+    };
+
+    let newline_count = position_chunks.iter().map(Vec::len).sum::<usize>();
+    let mut starts = Vec::with_capacity(newline_count.saturating_add(1));
+    let mut skip_lf_at = None;
+    starts.push(0);
+    for positions in position_chunks {
+        append_newline_starts(&mut starts, 0, bytes, positions, &mut skip_lf_at);
+    }
+
+    LineIndex {
+        starts,
+        indexed_len: bytes.len(),
+        complete: true,
+    }
+}
+
+fn newline_positions(base_offset: usize, bytes: &[u8]) -> Vec<usize> {
+    memchr2_iter(b'\r', b'\n', bytes)
+        .map(|index| base_offset + index)
+        .collect()
+}
+
+fn append_newline_starts(
+    starts: &mut Vec<usize>,
+    base_offset: usize,
+    bytes: &[u8],
+    newline_positions: impl IntoIterator<Item = usize>,
+    skip_lf_at: &mut Option<usize>,
+) {
+    for newline_index in newline_positions {
+        if *skip_lf_at == Some(newline_index) {
+            *skip_lf_at = None;
             continue;
         }
 
-        if bytes[newline_index] == b'\r' && bytes.get(newline_index + 1) == Some(&b'\n') {
-            starts.push(base_offset + newline_index + 2);
-            skip_lf_at = Some(newline_index + 1);
+        debug_assert!(newline_index >= base_offset);
+        let local_index = newline_index - base_offset;
+        if bytes[local_index] == b'\r' && bytes.get(local_index + 1) == Some(&b'\n') {
+            starts.push(newline_index + 2);
+            *skip_lf_at = Some(newline_index + 1);
         } else {
-            starts.push(base_offset + newline_index + 1);
-            skip_lf_at = None;
+            starts.push(newline_index + 1);
+            *skip_lf_at = None;
         }
     }
-    starts
 }
 
 pub fn detect_line_ending(bytes: &[u8]) -> LineEnding {
@@ -266,6 +353,39 @@ mod tests {
         let index = LineIndex::build(b"a\r\nb\nc\rd");
         assert_eq!(index.starts(), &[0, 3, 5, 7]);
         assert_eq!(index.line_for_offset(4), 1);
+    }
+
+    #[test]
+    fn parallel_build_matches_sequential_with_chunk_boundary_crlf() {
+        let bytes = b"aa\r\nbb\ncc\rdd\r\nee";
+
+        assert_eq!(
+            build_parallel_with_chunk_len(bytes, 3),
+            LineIndex::build(bytes)
+        );
+    }
+
+    #[test]
+    fn parallel_build_matches_sequential_with_absolute_chunk_offsets() {
+        let bytes = b"abc\ndef\nghi\r\njkl\rmno\n";
+
+        assert_eq!(
+            build_parallel_with_chunk_len(bytes, 5),
+            LineIndex::build(bytes)
+        );
+    }
+
+    #[test]
+    fn parallel_build_matches_sequential_for_many_chunks() {
+        let mut bytes = Vec::new();
+        for index in 0..512 {
+            bytes.extend_from_slice(format!("line {index}\r\n").as_bytes());
+        }
+
+        assert_eq!(
+            build_parallel_with_chunk_len(&bytes, 17),
+            LineIndex::build(&bytes)
+        );
     }
 
     #[test]

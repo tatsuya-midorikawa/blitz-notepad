@@ -3484,13 +3484,15 @@ fn draw_text_area(
     draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
     for (index, line) in visible_lines.iter().enumerate() {
         let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
-        let text = text_prefix_for_width(
-            fonts,
+        canvas.clipped_text(
+            TEXT_MARGIN_X,
+            y,
             &line.text,
+            COLOR_TEXT,
             TextRole::Editor,
+            fonts,
             metrics.editor_text_width,
         );
-        canvas.text(TEXT_MARGIN_X, y, text, COLOR_TEXT, TextRole::Editor, fonts);
     }
 
     if visible_lines.is_empty() {
@@ -3809,7 +3811,8 @@ struct LoadedFont {
 struct FontStack {
     fonts: Vec<LoadedFont>,
     glyph_cache: RefCell<HashMap<GlyphCacheKey, GlyphMetrics>>,
-    emoji_cluster_cache: RefCell<HashMap<EmojiClusterKey, Option<EmojiClusterMetrics>>>,
+    emoji_cluster_cache: RefCell<HashMap<TextRole, HashMap<String, Option<EmojiClusterMetrics>>>>,
+    color_glyph_cache: RefCell<HashMap<ColorGlyphCacheKey, Option<CachedColorGlyphImage>>>,
     scale_context: RefCell<ScaleContext>,
     shape_context: RefCell<ShapeContext>,
 }
@@ -3827,12 +3830,6 @@ struct GlyphMetrics {
     advance: f32,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct EmojiClusterKey {
-    text: String,
-    role: TextRole,
-}
-
 #[derive(Clone, Debug)]
 struct EmojiClusterMetrics {
     font_index: usize,
@@ -3846,6 +3843,34 @@ struct EmojiClusterGlyph {
     x: f32,
     y: f32,
     advance: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ColorGlyphCacheKey {
+    font_index: usize,
+    glyph_id: SwashGlyphId,
+    size_bits: u32,
+}
+
+#[derive(Clone, Debug)]
+struct CachedColorGlyphImage {
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+    data: Arc<[u8]>,
+}
+
+impl CachedColorGlyphImage {
+    fn from_swash(image: swash::scale::image::Image) -> Self {
+        Self {
+            left: image.placement.left,
+            top: image.placement.top,
+            width: image.placement.width as usize,
+            height: image.placement.height as usize,
+            data: Arc::from(image.data.into_boxed_slice()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3903,6 +3928,7 @@ impl FontStack {
             fonts,
             glyph_cache: RefCell::new(HashMap::new()),
             emoji_cluster_cache: RefCell::new(HashMap::new()),
+            color_glyph_cache: RefCell::new(HashMap::new()),
             scale_context: RefCell::new(ScaleContext::new()),
             shape_context: RefCell::new(ShapeContext::new()),
         })
@@ -3991,6 +4017,60 @@ impl FontStack {
                         cursor += self.measure_char(unit.first, role);
                     } else {
                         let metrics = self.glyph_metrics(unit.first, role);
+                        self.draw_outline_or_missing(
+                            canvas, unit.first, &metrics, cursor, baseline, size, color,
+                        );
+                        cursor += metrics.advance;
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_text_clipped(
+        &self,
+        canvas: &mut Canvas,
+        x: f32,
+        baseline: f32,
+        text: &str,
+        color: u32,
+        role: TextRole,
+        max_width: usize,
+    ) {
+        let max_x = x + max_width as f32;
+        let size = self.size(role);
+        let mut cursor = x;
+        for unit in text_units(text) {
+            match unit.kind {
+                TextUnitKind::EmojiCluster => {
+                    if let Some(metrics) = self.emoji_cluster_metrics(unit.text, role) {
+                        if cursor + metrics.advance > max_x {
+                            break;
+                        }
+                        self.draw_emoji_cluster(canvas, &metrics, cursor, baseline, role);
+                        cursor += metrics.advance;
+                    } else {
+                        let advance = self.measure_text_by_char(unit.text, role);
+                        if cursor + advance > max_x {
+                            break;
+                        }
+                        cursor += self
+                            .draw_text_by_char(canvas, cursor, baseline, unit.text, color, role);
+                    }
+                }
+                TextUnitKind::Ignorable => {}
+                TextUnitKind::Character => {
+                    if unit.first == '\t' {
+                        let advance = self.measure_char(unit.first, role);
+                        if cursor + advance > max_x {
+                            break;
+                        }
+                        cursor += advance;
+                    } else {
+                        let metrics = self.glyph_metrics(unit.first, role);
+                        if cursor + metrics.advance > max_x {
+                            break;
+                        }
                         self.draw_outline_or_missing(
                             canvas, unit.first, &metrics, cursor, baseline, size, color,
                         );
@@ -4152,24 +4232,8 @@ impl FontStack {
         font_index: usize,
         glyph_id: SwashGlyphId,
         role: TextRole,
-    ) -> Option<swash::scale::image::Image> {
-        if glyph_id == 0 {
-            return None;
-        }
-
-        let font = self.swash_font(font_index)?;
-        let mut context = self.scale_context.borrow_mut();
-        let mut scaler = context
-            .builder(font)
-            .size(self.size(role))
-            .hint(true)
-            .build();
-        Render::new(&[
-            Source::ColorOutline(0),
-            Source::ColorBitmap(StrikeWith::BestFit),
-        ])
-        .render(&mut scaler, glyph_id)
-        .filter(|image| image.content == Content::Color)
+    ) -> Option<CachedColorGlyphImage> {
+        self.color_glyph_image_with_size(font_index, glyph_id, self.size(role))
     }
 
     fn color_glyph_image_with_size(
@@ -4177,11 +4241,33 @@ impl FontStack {
         font_index: usize,
         glyph_id: SwashGlyphId,
         size: f32,
-    ) -> Option<swash::scale::image::Image> {
+    ) -> Option<CachedColorGlyphImage> {
         if glyph_id == 0 {
             return None;
         }
 
+        let key = ColorGlyphCacheKey {
+            font_index,
+            glyph_id,
+            size_bits: size.to_bits(),
+        };
+        if let Some(image) = self.color_glyph_cache.borrow().get(&key) {
+            return image.clone();
+        }
+
+        let image = self.render_color_glyph_image(font_index, glyph_id, size);
+        self.color_glyph_cache
+            .borrow_mut()
+            .insert(key, image.clone());
+        image
+    }
+
+    fn render_color_glyph_image(
+        &self,
+        font_index: usize,
+        glyph_id: SwashGlyphId,
+        size: f32,
+    ) -> Option<CachedColorGlyphImage> {
         let font = self.swash_font(font_index)?;
         let mut context = self.scale_context.borrow_mut();
         let mut scaler = context.builder(font).size(size).hint(true).build();
@@ -4191,21 +4277,25 @@ impl FontStack {
         ])
         .render(&mut scaler, glyph_id)
         .filter(|image| image.content == Content::Color)
+        .map(CachedColorGlyphImage::from_swash)
     }
 
     fn emoji_cluster_metrics(&self, text: &str, role: TextRole) -> Option<EmojiClusterMetrics> {
-        let key = EmojiClusterKey {
-            text: text.to_owned(),
-            role,
-        };
-        if let Some(metrics) = self.emoji_cluster_cache.borrow().get(&key) {
+        if let Some(metrics) = self
+            .emoji_cluster_cache
+            .borrow()
+            .get(&role)
+            .and_then(|by_text| by_text.get(text))
+        {
             return metrics.clone();
         }
 
         let metrics = self.shape_emoji_cluster(text, role);
         self.emoji_cluster_cache
             .borrow_mut()
-            .insert(key, metrics.clone());
+            .entry(role)
+            .or_default()
+            .insert(text.to_owned(), metrics.clone());
         metrics
     }
 
@@ -4387,12 +4477,12 @@ fn draw_color_glyph_image(
     canvas: &mut Canvas,
     x: f32,
     baseline: f32,
-    image: &swash::scale::image::Image,
+    image: &CachedColorGlyphImage,
 ) {
-    let left = x.floor() as i32 + image.placement.left;
-    let top = baseline.floor() as i32 - image.placement.top;
-    let width = image.placement.width as usize;
-    let height = image.placement.height as usize;
+    let left = x.floor() as i32 + image.left;
+    let top = baseline.floor() as i32 - image.top;
+    let width = image.width;
+    let height = image.height;
     if width == 0 || height == 0 {
         return;
     }
@@ -4482,13 +4572,17 @@ impl Canvas {
     }
 
     fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: u32) {
-        let end_x = (x + width).min(self.width);
-        let end_y = (y + height).min(self.height);
-        for yy in y.min(self.height)..end_y {
-            let row_start = yy * self.width;
-            for xx in x.min(self.width)..end_x {
-                self.pixels[row_start + xx] = color;
-            }
+        let start_x = x.min(self.width);
+        let end_x = x.saturating_add(width).min(self.width);
+        let start_y = y.min(self.height);
+        let end_y = y.saturating_add(height).min(self.height);
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+
+        for row in start_y..end_y {
+            let row_start = row * self.width;
+            self.pixels[row_start + start_x..row_start + end_x].fill(color);
         }
     }
 
@@ -4534,6 +4628,25 @@ impl Canvas {
                 TextRole::Editor => 19.0,
             };
         fonts.draw_text(self, x as f32, baseline, text, color, role);
+    }
+
+    fn clipped_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        color: u32,
+        role: TextRole,
+        fonts: &FontStack,
+        max_width: usize,
+    ) {
+        let baseline = y as f32
+            + match role {
+                TextRole::Ui => 15.0,
+                TextRole::Find => 13.0,
+                TextRole::Editor => 19.0,
+            };
+        fonts.draw_text_clipped(self, x as f32, baseline, text, color, role, max_width);
     }
 
     fn blend_pixel(&mut self, x: i32, y: i32, color: u32, coverage: f32) {
@@ -4888,6 +5001,62 @@ mod tests {
         assert_eq!(first_width, second_width);
         assert_eq!(fonts.glyph_cache.borrow().len(), cache_len);
         assert!(cache_len <= 2);
+    }
+
+    #[test]
+    fn font_stack_reuses_color_glyph_images() {
+        let fonts = FontStack::load().expect("fonts");
+        let Some(metrics) = fonts.emoji_cluster_metrics("😀", TextRole::Editor) else {
+            return;
+        };
+        let Some(glyph) = metrics.glyphs.first() else {
+            return;
+        };
+        fonts.color_glyph_cache.borrow_mut().clear();
+
+        let first = fonts.color_glyph_image_with_size(
+            metrics.font_index,
+            glyph.id,
+            fonts.emoji_size(TextRole::Editor),
+        );
+        let cache_len = fonts.color_glyph_cache.borrow().len();
+        let second = fonts.color_glyph_image_with_size(
+            metrics.font_index,
+            glyph.id,
+            fonts.emoji_size(TextRole::Editor),
+        );
+
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert_eq!(fonts.color_glyph_cache.borrow().len(), cache_len);
+        assert_eq!(cache_len, 1);
+    }
+
+    #[test]
+    fn font_stack_reuses_emoji_cluster_metrics() {
+        let fonts = FontStack::load().expect("fonts");
+        fonts.emoji_cluster_cache.borrow_mut().clear();
+
+        let first = fonts.emoji_cluster_metrics("😀", TextRole::Editor);
+        let cache_len = fonts
+            .emoji_cluster_cache
+            .borrow()
+            .get(&TextRole::Editor)
+            .map(HashMap::len)
+            .unwrap_or(0);
+        let second = fonts.emoji_cluster_metrics("😀", TextRole::Editor);
+
+        assert_eq!(first.is_some(), second.is_some());
+        assert_eq!(cache_len, 1);
+        assert_eq!(
+            fonts
+                .emoji_cluster_cache
+                .borrow()
+                .get(&TextRole::Editor)
+                .map(HashMap::len)
+                .unwrap_or(0),
+            cache_len
+        );
     }
 
     #[test]
