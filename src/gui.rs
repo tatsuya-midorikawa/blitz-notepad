@@ -214,6 +214,7 @@ struct GuiState {
     save_job: Option<SaveJob>,
     print_job: Option<PrintJob>,
     fonts: FontStack,
+    wrapped_row_index: RefCell<Option<WrappedRowIndex>>,
 }
 
 impl GuiState {
@@ -239,6 +240,7 @@ impl GuiState {
             save_job: None,
             print_job: None,
             fonts,
+            wrapped_row_index: RefCell::new(None),
         })
     }
 
@@ -267,11 +269,11 @@ impl GuiState {
         self.mouse_selecting = false;
     }
 
-    fn scroll_vertical(&mut self, app: &BlitzApp, delta_lines: isize, visible_lines: usize) {
-        let max_first_line = max_first_visible_line(app, visible_lines);
+    fn scroll_vertical(&mut self, app: &BlitzApp, delta_lines: isize, metrics: EditorMetrics) {
+        let max_first_line = max_first_visible_line_for_metrics(app, self, metrics);
         self.first_visible_line =
             offset_with_delta(self.first_visible_line, delta_lines).min(max_first_line);
-        self.clamp_horizontal(app, visible_lines);
+        self.clamp_horizontal(app, metrics.visible_line_count);
     }
 
     fn scroll_horizontal(&mut self, app: &BlitzApp, delta_bytes: isize, visible_lines: usize) {
@@ -306,19 +308,26 @@ impl GuiState {
                 return Ok(());
             }
 
-            let caret_line = app.document().line_for_offset(app.caret_offset())?;
-            if caret_line < self.first_visible_line {
-                self.first_visible_line = caret_line;
-            } else if caret_line >= self.first_visible_line + metrics.visible_line_count {
-                self.first_visible_line = caret_line
-                    .saturating_sub(metrics.visible_line_count)
-                    .saturating_add(1);
-            }
-            self.first_visible_line = self
-                .first_visible_line
-                .min(max_first_visible_line(app, metrics.visible_line_count));
-
-            if !app.settings().word_wrap {
+            if app.settings().word_wrap {
+                let caret_row =
+                    wrapped_visual_row_for_offset(app, self, metrics, app.caret_offset())?;
+                if caret_row < self.first_visible_line {
+                    self.first_visible_line = caret_row;
+                } else if caret_row >= self.first_visible_line + metrics.visible_line_count {
+                    self.first_visible_line = caret_row
+                        .saturating_sub(metrics.visible_line_count)
+                        .saturating_add(1);
+                }
+                self.horizontal_offset = 0;
+            } else {
+                let caret_line = app.document().line_for_offset(app.caret_offset())?;
+                if caret_line < self.first_visible_line {
+                    self.first_visible_line = caret_line;
+                } else if caret_line >= self.first_visible_line + metrics.visible_line_count {
+                    self.first_visible_line = caret_line
+                        .saturating_sub(metrics.visible_line_count)
+                        .saturating_add(1);
+                }
                 let visible_line =
                     app.document()
                         .visible_lines_at(caret_line, 1, self.horizontal_offset);
@@ -331,6 +340,9 @@ impl GuiState {
                     }
                 }
             }
+            self.first_visible_line = self
+                .first_visible_line
+                .min(max_first_visible_line_for_metrics(app, self, metrics));
             self.clamp_horizontal(app, metrics.visible_line_count);
         }
 
@@ -352,10 +364,14 @@ impl GuiState {
             return Ok(false);
         }
 
-        let selection_line = app.document().line_for_offset(selection.start)?;
-        self.first_visible_line = selection_line
+        let selection_row = if app.settings().word_wrap {
+            wrapped_visual_row_for_offset(app, self, metrics, reveal_offset)?
+        } else {
+            app.document().line_for_offset(reveal_offset)?
+        };
+        self.first_visible_line = selection_row
             .saturating_sub(metrics.visible_line_count / 2)
-            .min(max_first_visible_line(app, metrics.visible_line_count));
+            .min(max_first_visible_line_for_metrics(app, self, metrics));
         self.center_horizontal_range(app, metrics, selection)?;
         self.clamp_horizontal(app, metrics.visible_line_count);
         Ok(true)
@@ -386,6 +402,15 @@ impl GuiState {
             centered_offset_for_range(relative_start, relative_end, visible_bytes);
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+struct WrappedRowIndex {
+    generation: u64,
+    line_count: usize,
+    editor_text_width: usize,
+    row_starts: Vec<usize>,
+    total_rows: usize,
 }
 
 struct SaveJob {
@@ -944,10 +969,11 @@ fn handle_scrollbar_click(
     };
 
     if x >= metrics.text_width && y >= metrics.text_top && y < metrics.editor_bottom {
+        let content_len = vertical_content_len(app, gui_state, metrics);
         let (thumb_y, thumb_height) = scroll_thumb(
             metrics.text_top,
             metrics.text_height,
-            app.document().line_count(),
+            content_len,
             metrics.visible_line_count,
             gui_state.first_visible_line,
         );
@@ -965,7 +991,7 @@ fn handle_scrollbar_click(
         } else {
             0
         };
-        gui_state.scroll_vertical(app, delta, metrics.visible_line_count);
+        gui_state.scroll_vertical(app, delta, metrics);
         return Ok(true);
     }
 
@@ -1020,10 +1046,11 @@ fn update_scroll_drag(
 
     match gui_state.scroll_drag {
         Some(ScrollDrag::Vertical { grab_offset }) => {
+            let content_len = vertical_content_len(app, gui_state, metrics);
             let (_, thumb_height) = scroll_thumb(
                 metrics.text_top,
                 metrics.text_height,
-                app.document().line_count(),
+                content_len,
                 metrics.visible_line_count,
                 gui_state.first_visible_line,
             );
@@ -1035,11 +1062,11 @@ fn update_scroll_drag(
                 metrics.text_top,
                 metrics.text_height,
                 thumb_height,
-                app.document().line_count(),
+                content_len,
                 metrics.visible_line_count,
                 thumb_y,
             );
-            gui_state.scroll_vertical(app, 0, metrics.visible_line_count);
+            gui_state.scroll_vertical(app, 0, metrics);
         }
         Some(ScrollDrag::Horizontal { grab_offset }) => {
             let max_line_len = max_visible_line_len(
@@ -1907,7 +1934,7 @@ fn handle_scroll_wheel(
     if !is_shift_down(window) {
         let delta_lines = (-(scroll_y * WHEEL_LINES as f32).round()) as isize;
         if delta_lines != 0 {
-            gui_state.scroll_vertical(app, delta_lines, metrics.visible_line_count);
+            gui_state.scroll_vertical(app, delta_lines, metrics);
         }
     }
 
@@ -1934,7 +1961,7 @@ fn scroll_page(
         gui_state.scroll_vertical(
             app,
             direction * metrics.visible_line_count as isize,
-            metrics.visible_line_count,
+            metrics,
         );
     }
     Ok(())
@@ -3485,10 +3512,21 @@ fn editor_metrics_from_flags(
     })
 }
 
-fn max_first_visible_line(app: &BlitzApp, visible_lines: usize) -> usize {
-    app.document()
-        .line_count()
-        .saturating_sub(visible_lines.max(1))
+fn max_first_visible_line_for_metrics(
+    app: &BlitzApp,
+    gui_state: &GuiState,
+    metrics: EditorMetrics,
+) -> usize {
+    vertical_content_len(app, gui_state, metrics).saturating_sub(metrics.visible_line_count)
+}
+
+fn vertical_content_len(app: &BlitzApp, gui_state: &GuiState, metrics: EditorMetrics) -> usize {
+    if app.settings().word_wrap {
+        with_wrapped_row_index(app, gui_state, metrics, |index| index.total_rows)
+    } else {
+        app.document().line_count()
+    }
+    .max(1)
 }
 
 fn max_visible_line_len(app: &BlitzApp, first_line: usize, visible_lines: usize) -> usize {
@@ -3576,10 +3614,11 @@ fn draw_vertical_scrollbar(
     gui_state: &GuiState,
     metrics: EditorMetrics,
 ) {
+    let content_len = vertical_content_len(app, gui_state, metrics);
     let (thumb_y, thumb_height) = scroll_thumb(
         metrics.text_top,
         metrics.text_height,
-        app.document().line_count(),
+        content_len,
         metrics.visible_line_count,
         gui_state.first_visible_line,
     );
@@ -3669,15 +3708,9 @@ fn draw_text_area(
 
     let first_visible_line = gui_state
         .first_visible_line
-        .min(max_first_visible_line(app, metrics.visible_line_count));
-    let visible_lines = editor_visible_lines(
-        app,
-        first_visible_line,
-        metrics,
-        gui_state,
-        fonts,
-        state.word_wrap,
-    );
+        .min(max_first_visible_line_for_metrics(app, gui_state, metrics));
+    let visible_lines =
+        editor_visible_lines(app, first_visible_line, metrics, gui_state, state.word_wrap);
     draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
     for (index, line) in visible_lines.iter().enumerate() {
         let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
@@ -3694,11 +3727,9 @@ fn draw_text_area(
 
     if visible_lines.is_empty() {
         draw_caret(canvas, TEXT_MARGIN_X, metrics.text_top + TEXT_MARGIN_Y);
-    } else if let Some(visible_index) = visible_lines.iter().position(|line| {
-        line.number == state.caret_line
-            && app.caret_offset() >= line.byte_range.start
-            && app.caret_offset() <= line.byte_range.end
-    }) {
+    } else if let Some(visible_index) =
+        visible_line_index_for_caret(&visible_lines, state.caret_line, app.caret_offset())
+    {
         let line = &visible_lines[visible_index];
         let local_offset = app
             .caret_offset()
@@ -3714,12 +3745,30 @@ fn draw_text_area(
     }
 }
 
+fn visible_line_index_for_caret(
+    visible_lines: &[VisibleLine],
+    caret_line: usize,
+    caret_offset: usize,
+) -> Option<usize> {
+    visible_lines
+        .iter()
+        .rposition(|line| {
+            line.number == caret_line
+                && caret_offset >= line.byte_range.start
+                && caret_offset < line.byte_range.end
+        })
+        .or_else(|| {
+            visible_lines
+                .iter()
+                .rposition(|line| line.number == caret_line && caret_offset == line.byte_range.end)
+        })
+}
+
 fn editor_visible_lines(
     app: &BlitzApp,
     first_visible_line: usize,
     metrics: EditorMetrics,
     gui_state: &GuiState,
-    fonts: &FontStack,
     word_wrap: bool,
 ) -> Vec<VisibleLine> {
     if !word_wrap {
@@ -3734,39 +3783,91 @@ fn editor_visible_lines(
         app,
         first_visible_line,
         metrics.visible_line_count,
-        fonts,
-        metrics.editor_text_width,
+        gui_state,
+        metrics,
     )
 }
 
 fn wrapped_visible_lines(
     app: &BlitzApp,
-    first_visible_line: usize,
+    first_visible_row: usize,
     max_rows: usize,
-    fonts: &FontStack,
-    max_width: usize,
+    gui_state: &GuiState,
+    metrics: EditorMetrics,
 ) -> Vec<VisibleLine> {
     let mut rows = Vec::with_capacity(max_rows);
-    let mut document_line = first_visible_line;
+    let (mut document_line, mut rows_to_skip) =
+        with_wrapped_row_index(app, gui_state, metrics, |index| {
+            wrapped_line_for_visual_row(index, first_visible_row)
+        });
     let line_count = app.document().line_count();
 
     while rows.len() < max_rows && document_line < line_count {
-        let Some(line) = app
-            .document()
-            .visible_lines_at(document_line, 1, 0)
-            .into_iter()
-            .next()
-        else {
-            break;
-        };
-        append_wrapped_line_segments(&mut rows, line, max_rows, fonts, max_width);
+        append_wrapped_document_line_segments(
+            app,
+            document_line,
+            &mut rows_to_skip,
+            &mut rows,
+            max_rows,
+            &gui_state.fonts,
+            metrics.editor_text_width,
+        );
         document_line += 1;
     }
 
     rows
 }
 
+fn append_wrapped_document_line_segments(
+    app: &BlitzApp,
+    document_line: usize,
+    rows_to_skip: &mut usize,
+    rows: &mut Vec<VisibleLine>,
+    max_rows: usize,
+    fonts: &FontStack,
+    max_width: usize,
+) {
+    let Some(content_range) = document_line_content_range(app, document_line) else {
+        return;
+    };
+    if content_range.is_empty() {
+        append_wrapped_segment(
+            rows_to_skip,
+            rows,
+            max_rows,
+            VisibleLine {
+                number: document_line + 1,
+                byte_range: content_range.clone(),
+                text: String::new(),
+            },
+        );
+        return;
+    }
+
+    let mut local_offset = 0usize;
+    while content_range.start + local_offset < content_range.end && rows.len() < max_rows {
+        let Some(chunk) = app
+            .document()
+            .visible_lines_at(document_line, 1, local_offset)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        if chunk.byte_range.is_empty() {
+            break;
+        }
+        let next_local_offset = chunk.byte_range.end.saturating_sub(content_range.start);
+        append_wrapped_line_segments(rows_to_skip, rows, chunk, max_rows, fonts, max_width);
+        if next_local_offset <= local_offset {
+            break;
+        }
+        local_offset = next_local_offset;
+    }
+}
+
 fn append_wrapped_line_segments(
+    rows_to_skip: &mut usize,
     rows: &mut Vec<VisibleLine>,
     line: VisibleLine,
     max_rows: usize,
@@ -3774,7 +3875,7 @@ fn append_wrapped_line_segments(
     max_width: usize,
 ) {
     if line.text.is_empty() {
-        rows.push(line);
+        append_wrapped_segment(rows_to_skip, rows, max_rows, line);
         return;
     }
 
@@ -3783,12 +3884,31 @@ fn append_wrapped_line_segments(
         let segment_end = wrapped_segment_end(fonts, &line.text, segment_start, max_width);
         debug_assert!(segment_end > segment_start);
         let text = line.text[segment_start..segment_end].to_owned();
-        rows.push(VisibleLine {
-            number: line.number,
-            byte_range: line.byte_range.start + segment_start..line.byte_range.start + segment_end,
-            text,
-        });
+        append_wrapped_segment(
+            rows_to_skip,
+            rows,
+            max_rows,
+            VisibleLine {
+                number: line.number,
+                byte_range: line.byte_range.start + segment_start
+                    ..line.byte_range.start + segment_end,
+                text,
+            },
+        );
         segment_start = segment_end;
+    }
+}
+
+fn append_wrapped_segment(
+    rows_to_skip: &mut usize,
+    rows: &mut Vec<VisibleLine>,
+    max_rows: usize,
+    segment: VisibleLine,
+) {
+    if *rows_to_skip > 0 {
+        *rows_to_skip -= 1;
+    } else if rows.len() < max_rows {
+        rows.push(segment);
     }
 }
 
@@ -3818,6 +3938,208 @@ fn wrapped_segment_end(
     }
 
     text.len()
+}
+
+fn with_wrapped_row_index<T>(
+    app: &BlitzApp,
+    gui_state: &GuiState,
+    metrics: EditorMetrics,
+    visit: impl FnOnce(&WrappedRowIndex) -> T,
+) -> T {
+    let generation = app.document().change_generation();
+    let line_count = app.document().line_count();
+    let editor_text_width = metrics.editor_text_width;
+    // Wrapped row starts depend only on document content, line index shape, and wrap width.
+    let needs_rebuild = gui_state
+        .wrapped_row_index
+        .borrow()
+        .as_ref()
+        .is_none_or(|index| {
+            index.generation != generation
+                || index.line_count != line_count
+                || index.editor_text_width != editor_text_width
+        });
+
+    if needs_rebuild {
+        let mut row_starts = Vec::with_capacity(line_count);
+        let mut total_rows = 0usize;
+        for line in 0..line_count {
+            row_starts.push(total_rows);
+            total_rows = total_rows.saturating_add(wrapped_line_row_count(
+                app,
+                line,
+                &gui_state.fonts,
+                editor_text_width,
+            ));
+        }
+        *gui_state.wrapped_row_index.borrow_mut() = Some(WrappedRowIndex {
+            generation,
+            line_count,
+            editor_text_width,
+            row_starts,
+            total_rows: total_rows.max(1),
+        });
+    }
+
+    let index = gui_state.wrapped_row_index.borrow();
+    visit(index.as_ref().expect("wrapped row index initialized"))
+}
+
+fn wrapped_line_for_visual_row(index: &WrappedRowIndex, visual_row: usize) -> (usize, usize) {
+    if index.row_starts.is_empty() {
+        return (0, 0);
+    }
+
+    let clamped_row = visual_row.min(index.total_rows.saturating_sub(1));
+    let line = index
+        .row_starts
+        .partition_point(|start| *start <= clamped_row)
+        .saturating_sub(1)
+        .min(index.row_starts.len().saturating_sub(1));
+    (line, clamped_row.saturating_sub(index.row_starts[line]))
+}
+
+fn wrapped_line_row_count(
+    app: &BlitzApp,
+    document_line: usize,
+    fonts: &FontStack,
+    max_width: usize,
+) -> usize {
+    let Some(content_range) = document_line_content_range(app, document_line) else {
+        return 0;
+    };
+    if content_range.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 0usize;
+    let mut local_offset = 0usize;
+    while content_range.start + local_offset < content_range.end {
+        let Some(chunk) = app
+            .document()
+            .visible_lines_at(document_line, 1, local_offset)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        if chunk.byte_range.is_empty() {
+            break;
+        }
+        rows += wrapped_text_row_count(fonts, &chunk.text, max_width);
+        let next_local_offset = chunk.byte_range.end.saturating_sub(content_range.start);
+        if next_local_offset <= local_offset {
+            break;
+        }
+        local_offset = next_local_offset;
+    }
+
+    rows.max(1)
+}
+
+fn wrapped_text_row_count(fonts: &FontStack, text: &str, max_width: usize) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 0usize;
+    let mut segment_start = 0usize;
+    while segment_start < text.len() {
+        let segment_end = wrapped_segment_end(fonts, text, segment_start, max_width);
+        debug_assert!(segment_end > segment_start);
+        if segment_end <= segment_start {
+            break;
+        }
+        rows += 1;
+        segment_start = segment_end;
+    }
+    rows.max(1)
+}
+
+fn wrapped_visual_row_for_offset(
+    app: &BlitzApp,
+    gui_state: &GuiState,
+    metrics: EditorMetrics,
+    byte_offset: usize,
+) -> Result<usize> {
+    let document_line = app.document().line_for_offset(byte_offset)?;
+    let preceding_rows = with_wrapped_row_index(app, gui_state, metrics, |index| {
+        index.row_starts.get(document_line).copied().unwrap_or(0)
+    });
+
+    Ok(preceding_rows
+        + wrapped_row_in_line_for_offset(
+            app,
+            document_line,
+            &gui_state.fonts,
+            metrics.editor_text_width,
+            byte_offset,
+        ))
+}
+
+fn wrapped_row_in_line_for_offset(
+    app: &BlitzApp,
+    document_line: usize,
+    fonts: &FontStack,
+    max_width: usize,
+    byte_offset: usize,
+) -> usize {
+    let Some(content_range) = document_line_content_range(app, document_line) else {
+        return 0;
+    };
+    if content_range.is_empty() || byte_offset <= content_range.start {
+        return 0;
+    }
+
+    let target_offset = byte_offset.min(content_range.end);
+    let mut row = 0usize;
+    let mut local_offset = 0usize;
+    while content_range.start + local_offset < content_range.end {
+        let Some(chunk) = app
+            .document()
+            .visible_lines_at(document_line, 1, local_offset)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        if chunk.byte_range.is_empty() {
+            break;
+        }
+
+        let mut segment_start = 0usize;
+        while segment_start < chunk.text.len() {
+            let segment_end = wrapped_segment_end(fonts, &chunk.text, segment_start, max_width);
+            debug_assert!(segment_end > segment_start);
+            if segment_end <= segment_start {
+                return row;
+            }
+            let absolute_end = chunk.byte_range.start + segment_end;
+            if target_offset < absolute_end {
+                return row;
+            }
+            row += 1;
+            segment_start = segment_end;
+        }
+
+        let next_local_offset = chunk.byte_range.end.saturating_sub(content_range.start);
+        if next_local_offset <= local_offset {
+            break;
+        }
+        local_offset = next_local_offset;
+    }
+
+    row.saturating_sub(1)
+}
+
+fn document_line_content_range(
+    app: &BlitzApp,
+    document_line: usize,
+) -> Option<std::ops::Range<usize>> {
+    let line_start = app.document().line_start(document_line)?;
+    app.document()
+        .line_content_range_for_offset(line_start)
+        .ok()
 }
 
 fn draw_selection_highlights(
@@ -3901,13 +4223,12 @@ fn text_offset_for_point(
     let line_index = (y - metrics.text_top - TEXT_MARGIN_Y) / EDITOR_LINE_HEIGHT;
     let first_visible_line = gui_state
         .first_visible_line
-        .min(max_first_visible_line(app, metrics.visible_line_count));
+        .min(max_first_visible_line_for_metrics(app, gui_state, metrics));
     let visible_lines = editor_visible_lines(
         app,
         first_visible_line,
         metrics,
         gui_state,
-        &gui_state.fonts,
         app.settings().word_wrap,
     );
     let Some(line) = visible_lines.get(line_index) else {
@@ -5830,7 +6151,7 @@ mod tests {
         let state = app.ui_state().expect("ui state");
         let metrics = editor_metrics(&state, 220, 220).expect("metrics");
 
-        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, &gui_state.fonts, true);
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, true);
 
         assert!(rows.len() > 1);
         assert_eq!(rows[0].number, 1);
@@ -5852,7 +6173,7 @@ mod tests {
         let metrics = editor_metrics(&state, 240, 260).expect("metrics");
         let document_text = app.document().text_lossy();
 
-        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, &gui_state.fonts, true);
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, true);
 
         assert!(rows.len() > 1);
         assert!(rows.iter().all(|row| !row.text.contains('\u{fffd}')));
@@ -5872,7 +6193,7 @@ mod tests {
         let gui_state = GuiState::new().expect("gui state");
         let state = app.ui_state().expect("ui state");
         let metrics = editor_metrics(&state, 220, 220).expect("metrics");
-        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, &gui_state.fonts, true);
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, true);
         assert!(rows.len() > 1);
 
         let offset = text_offset_for_point(
@@ -5886,6 +6207,70 @@ mod tests {
         .expect("offset");
 
         assert!(rows[1].byte_range.contains(&offset) || offset == rows[1].byte_range.end);
+    }
+
+    #[test]
+    fn word_wrap_boundary_offsets_belong_to_following_visual_row() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"abcdef ".repeat(24)).expect("insert");
+        let gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 220).expect("metrics");
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, true);
+        assert!(rows.len() > 1);
+
+        let boundary = rows[1].byte_range.start;
+        let visual_row =
+            wrapped_visual_row_for_offset(&app, &gui_state, metrics, boundary).expect("row");
+
+        assert_eq!(visual_row, 1);
+    }
+
+    #[test]
+    fn caret_visual_line_prefers_following_wrapped_row_at_boundary() {
+        let rows = vec![
+            VisibleLine {
+                number: 1,
+                byte_range: 0..10,
+                text: "abcdefghij".to_owned(),
+            },
+            VisibleLine {
+                number: 1,
+                byte_range: 10..20,
+                text: "klmnopqrst".to_owned(),
+            },
+        ];
+
+        assert_eq!(visible_line_index_for_caret(&rows, 1, 10), Some(1));
+        assert_eq!(visible_line_index_for_caret(&rows, 1, 20), Some(1));
+    }
+
+    #[test]
+    fn word_wrap_vertical_scroll_moves_within_one_long_physical_line() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"abcdef ".repeat(96)).expect("insert");
+        let mut gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 180).expect("metrics");
+
+        let total_rows = vertical_content_len(&app, &gui_state, metrics);
+        let before = editor_visible_lines(&app, 0, metrics, &gui_state, true);
+        gui_state.scroll_vertical(&app, metrics.visible_line_count as isize, metrics);
+        let after = editor_visible_lines(
+            &app,
+            gui_state.first_visible_line,
+            metrics,
+            &gui_state,
+            true,
+        );
+
+        assert_eq!(app.document().line_count(), 1);
+        assert!(total_rows > metrics.visible_line_count);
+        assert!(gui_state.first_visible_line > 0);
+        assert_eq!(after[0].number, 1);
+        assert!(after[0].byte_range.start > before[0].byte_range.start);
     }
 
     #[test]
