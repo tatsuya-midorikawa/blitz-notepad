@@ -31,6 +31,14 @@ use swash::{
     text::Script,
     FontRef, GlyphId as SwashGlyphId,
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::{HWND, POINT, RECT},
+    UI::Input::Ime::{
+        ImmGetCompositionStringW, ImmGetContext, ImmGetOpenStatus, ImmReleaseContext,
+        ImmSetCompositionWindow, CFS_FORCE_POSITION, COMPOSITIONFORM, GCS_COMPSTR,
+    },
+};
 
 use crate::document::VisibleLine;
 use crate::ui::{MenuItem, NotepadUiState, MENU_BAR};
@@ -148,7 +156,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
         if handle_mouse(&window, &mut app, &mut gui_state)? {
             break;
         }
-        handle_keys(&window, &mut app, &mut gui_state)?;
+        handle_keys(&input_queue, &window, &mut app, &mut gui_state)?;
         handle_text_input(&input_queue, &window, &mut app, &mut gui_state)?;
         handle_find_window(&mut app, &mut gui_state)?;
         handle_dialog_window(&mut app, &mut gui_state)?;
@@ -160,6 +168,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
         let height = height.max(MIN_HEIGHT);
         handle_scroll_wheel(&window, &app, &mut gui_state, width, height)?;
         gui_state.follow_caret_if_moved(&app, width, height)?;
+        update_editor_ime_state(&window, &app, &mut gui_state, width, height);
         app.document().refresh_line_index();
         let state = app.ui_state()?;
         let signature = frame_signature(&app, &state, width, height, &gui_state);
@@ -215,6 +224,7 @@ struct GuiState {
     print_job: Option<PrintJob>,
     fonts: FontStack,
     wrapped_row_index: RefCell<Option<WrappedRowIndex>>,
+    editor_ime_composition: String,
 }
 
 impl GuiState {
@@ -241,6 +251,7 @@ impl GuiState {
             print_job: None,
             fonts,
             wrapped_row_index: RefCell::new(None),
+            editor_ime_composition: String::new(),
         })
     }
 
@@ -261,12 +272,14 @@ impl GuiState {
     fn reset_scroll(&mut self, app: &BlitzApp) {
         self.first_visible_line = 0;
         self.horizontal_offset = 0;
+        self.wrapped_row_index.borrow_mut().take();
         self.last_caret_offset = app.caret_offset();
         self.pending_reveal_selection = false;
         self.status_message = None;
         self.selection_anchor = None;
         self.selection_focus = None;
         self.mouse_selecting = false;
+        self.editor_ime_composition.clear();
     }
 
     fn scroll_vertical(&mut self, app: &BlitzApp, delta_lines: isize, metrics: EditorMetrics) {
@@ -292,6 +305,13 @@ impl GuiState {
             self.first_visible_line,
             visible_lines,
         ));
+    }
+
+    fn reset_word_wrap_view(&mut self) {
+        self.first_visible_line = 0;
+        self.horizontal_offset = 0;
+        self.wrapped_row_index.borrow_mut().take();
+        self.editor_ime_composition.clear();
     }
 
     fn follow_caret_if_moved(&mut self, app: &BlitzApp, width: usize, height: usize) -> Result<()> {
@@ -737,6 +757,7 @@ struct FrameSignature {
     first_visible_line: usize,
     horizontal_offset: usize,
     selected_range: Option<std::ops::Range<usize>>,
+    editor_ime_composition: String,
 }
 
 #[derive(Clone, Debug)]
@@ -765,6 +786,7 @@ fn frame_signature(
         first_visible_line: gui_state.first_visible_line,
         horizontal_offset: gui_state.horizontal_offset,
         selected_range: app.selected_range(),
+        editor_ime_composition: gui_state.editor_ime_composition.clone(),
     }
 }
 
@@ -1155,6 +1177,7 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
         return Ok(());
     };
 
+    position_find_ime_window(find_window, &gui_state.fonts);
     let frame = render_find_window(&find_window, &gui_state.fonts);
     find_window
         .window
@@ -1180,6 +1203,7 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
         );
     }
     if keep_open {
+        position_find_ime_window(find_window, &gui_state.fonts);
         let frame = render_find_window(&find_window, &gui_state.fonts);
         find_window
             .window
@@ -1198,6 +1222,7 @@ fn handle_find_window_keys(
     clipboard: &mut String,
     find_window: &mut FindWindowState,
 ) -> bool {
+    let command_down = is_command_down(&find_window.window);
     if find_window
         .window
         .is_key_pressed(Key::Escape, KeyRepeat::No)
@@ -1223,9 +1248,7 @@ fn handle_find_window_keys(
     if find_window.window.is_key_pressed(Key::Down, KeyRepeat::No) {
         find_window.forward = true;
     }
-    if is_command_down(&find_window.window)
-        && find_window.window.is_key_pressed(Key::V, KeyRepeat::No)
-    {
+    if command_down && find_window.window.is_key_pressed(Key::V, KeyRepeat::No) {
         paste_into_find_query(&mut find_window.query, clipboard);
         find_window.input_queue.borrow_mut().clear();
         return true;
@@ -1236,7 +1259,11 @@ fn handle_find_window_keys(
         .borrow_mut()
         .drain(..)
         .collect::<Vec<_>>();
-    if characters.is_empty() && !is_command_down(&find_window.window) {
+    if should_use_find_ascii_fallback(
+        characters.is_empty(),
+        command_down,
+        ime_is_open(&find_window.window),
+    ) {
         for key in find_window.window.get_keys_pressed(KeyRepeat::Yes) {
             if let Some(character) =
                 ascii_find_char_for_key(key, is_shift_down(&find_window.window))
@@ -1252,6 +1279,188 @@ fn handle_find_window_keys(
         }
     }
     true
+}
+
+fn should_use_find_ascii_fallback(
+    characters_empty: bool,
+    command_down: bool,
+    ime_open: bool,
+) -> bool {
+    characters_empty && !command_down && !ime_open
+}
+
+#[cfg(target_os = "windows")]
+fn ime_is_open(window: &Window) -> bool {
+    let Some(hwnd) = window_hwnd(window) else {
+        return false;
+    };
+
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.is_null() {
+            return false;
+        }
+        let open = ImmGetOpenStatus(context) != 0;
+        ImmReleaseContext(hwnd, context);
+        open
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ime_is_open(_window: &Window) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn position_find_ime_window(find_window: &FindWindowState, fonts: &FontStack) {
+    let x = find_ime_caret_x(fonts, &find_window.query);
+    position_ime_composition_window(&find_window.window, x, find_ime_caret_y());
+}
+
+#[cfg(not(target_os = "windows"))]
+fn position_find_ime_window(_find_window: &FindWindowState, _fonts: &FontStack) {}
+
+fn find_ime_caret_x(fonts: &FontStack, query: &str) -> usize {
+    let visible = text_prefix_for_width(
+        fonts,
+        query,
+        TextRole::Find,
+        FIND_FIELD_RECT.width.saturating_sub(12),
+    );
+    (FIND_FIELD_RECT.x + 6 + fonts.measure(visible, TextRole::Find))
+        .min(FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4)
+}
+
+fn find_ime_caret_y() -> usize {
+    centered_text_y(FIND_FIELD_RECT, TextRole::Find)
+}
+
+fn update_editor_ime_state(
+    window: &Window,
+    app: &BlitzApp,
+    gui_state: &mut GuiState,
+    width: usize,
+    height: usize,
+) {
+    if gui_state.find_window.is_some() || gui_state.dialog.is_some() {
+        gui_state.editor_ime_composition.clear();
+        return;
+    }
+    gui_state.editor_ime_composition = ime_composition_text(window).unwrap_or_default();
+    if let Some((x, y)) = editor_ime_caret_point(app, gui_state, width, height) {
+        position_ime_composition_window(window, x, y);
+    }
+}
+
+fn editor_ime_caret_point(
+    app: &BlitzApp,
+    gui_state: &GuiState,
+    width: usize,
+    height: usize,
+) -> Option<(usize, usize)> {
+    let metrics = editor_metrics_for_app(app, width, height)?;
+    let first_visible_line = gui_state
+        .first_visible_line
+        .min(max_first_visible_line_for_metrics(app, gui_state, metrics));
+    let visible_lines = editor_visible_lines(
+        app,
+        first_visible_line,
+        metrics,
+        gui_state,
+        app.settings().word_wrap,
+    );
+    if visible_lines.is_empty() {
+        return Some((TEXT_MARGIN_X, metrics.text_top + TEXT_MARGIN_Y));
+    }
+
+    let caret_line = app.document().line_for_offset(app.caret_offset()).ok()? + 1;
+    let visible_index =
+        visible_line_index_for_caret(&visible_lines, caret_line, app.caret_offset())?;
+    let line = &visible_lines[visible_index];
+    let local_offset = app
+        .caret_offset()
+        .saturating_sub(line.byte_range.start)
+        .min(line.text.len());
+    let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
+    let visible_prefix = text_prefix_for_width(
+        &gui_state.fonts,
+        prefix,
+        TextRole::Editor,
+        metrics.editor_text_width,
+    );
+    let x = (TEXT_MARGIN_X + gui_state.fonts.measure(visible_prefix, TextRole::Editor))
+        .min(TEXT_MARGIN_X + metrics.editor_text_width);
+    let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
+    Some((x, y))
+}
+
+#[cfg(target_os = "windows")]
+fn ime_composition_text(window: &Window) -> Option<String> {
+    let hwnd = window_hwnd(window)?;
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.is_null() {
+            return None;
+        }
+
+        let byte_len = ImmGetCompositionStringW(context, GCS_COMPSTR, core::ptr::null_mut(), 0);
+        let text = if byte_len > 0 {
+            let mut buffer = vec![0u16; byte_len as usize / 2];
+            let read_len = ImmGetCompositionStringW(
+                context,
+                GCS_COMPSTR,
+                buffer.as_mut_ptr().cast(),
+                byte_len as u32,
+            );
+            if read_len > 0 {
+                Some(String::from_utf16_lossy(&buffer[..read_len as usize / 2]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        ImmReleaseContext(hwnd, context);
+        text.filter(|text| !text.is_empty())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ime_composition_text(_window: &Window) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn position_ime_composition_window(window: &Window, x: usize, y: usize) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.is_null() {
+            return;
+        }
+        let form = COMPOSITIONFORM {
+            dwStyle: CFS_FORCE_POSITION,
+            ptCurrentPos: POINT {
+                x: x as i32,
+                y: y as i32,
+            },
+            rcArea: RECT::default(),
+        };
+        ImmSetCompositionWindow(context, &form);
+        ImmReleaseContext(hwnd, context);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn position_ime_composition_window(_window: &Window, _x: usize, _y: usize) {}
+
+#[cfg(target_os = "windows")]
+fn window_hwnd(window: &Window) -> Option<HWND> {
+    let hwnd = window.get_window_handle();
+    (!hwnd.is_null()).then_some(hwnd as HWND)
 }
 
 fn ascii_find_char_for_key(key: Key, shift: bool) -> Option<char> {
@@ -1967,7 +2176,12 @@ fn scroll_page(
     Ok(())
 }
 
-fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()> {
+fn handle_keys(
+    input_queue: &Rc<RefCell<Vec<char>>>,
+    window: &Window,
+    app: &mut BlitzApp,
+    gui_state: &mut GuiState,
+) -> Result<()> {
     if gui_state.dialog.is_some() {
         return Ok(());
     }
@@ -1976,7 +2190,11 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
         gui_state.active_menu = None;
     }
 
-    if is_command_down(window) {
+    let command_down = is_command_down(window);
+    let pending_text_input = input_queue_has_text(input_queue);
+    let ime_composition_active =
+        !gui_state.editor_ime_composition.is_empty() || ime_composition_text(window).is_some();
+    if should_handle_command_shortcuts(command_down, pending_text_input, ime_composition_active) {
         if window.is_key_pressed(Key::N, KeyRepeat::No) {
             if is_shift_down(window) {
                 open_new_window(gui_state);
@@ -2125,6 +2343,21 @@ fn handle_keys(window: &Window, app: &mut BlitzApp, gui_state: &mut GuiState) ->
     Ok(())
 }
 
+fn should_handle_command_shortcuts(
+    command_down: bool,
+    pending_text_input: bool,
+    ime_composition_active: bool,
+) -> bool {
+    command_down && !pending_text_input && !ime_composition_active
+}
+
+fn input_queue_has_text(input_queue: &Rc<RefCell<Vec<char>>>) -> bool {
+    input_queue
+        .borrow()
+        .iter()
+        .any(|character| !character.is_control())
+}
+
 fn move_caret_with_selection(
     window: &Window,
     app: &mut BlitzApp,
@@ -2151,17 +2384,17 @@ fn handle_text_input(
     app: &mut BlitzApp,
     gui_state: &mut GuiState,
 ) -> Result<()> {
-    if gui_state.dialog.is_some() {
-        input_queue.borrow_mut().clear();
-        return Ok(());
-    }
-
-    if is_command_down(window) {
+    if gui_state.dialog.is_some() || gui_state.find_window.is_some() {
         input_queue.borrow_mut().clear();
         return Ok(());
     }
 
     let characters = input_queue.borrow_mut().drain(..).collect::<Vec<_>>();
+    let has_text = characters.iter().any(|character| !character.is_control());
+    if is_command_down(window) && !has_text {
+        return Ok(());
+    }
+
     for character in characters {
         if !character.is_control() {
             app.insert_text(&character.to_string())?;
@@ -2318,11 +2551,14 @@ fn accept_dialog_state(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn is_command_down(window: &Window) -> bool {
-    window.is_key_down(Key::LeftCtrl)
-        || window.is_key_down(Key::RightCtrl)
-        || window.is_key_down(Key::LeftSuper)
-        || window.is_key_down(Key::RightSuper)
+    window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_command_down(window: &Window) -> bool {
+    window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl)
 }
 
 fn is_shift_down(window: &Window) -> bool {
@@ -2424,7 +2660,10 @@ fn execute_menu_row(
         ("Edit", "Go To...") => {
             open_go_to_dialog(app, gui_state)?;
         }
-        ("Format", "Word Wrap") => app.toggle_word_wrap(),
+        ("Format", "Word Wrap") => {
+            app.toggle_word_wrap();
+            gui_state.reset_word_wrap_view();
+        }
         ("Format", "Font...") => {
             open_info_window(
                 gui_state,
@@ -3712,17 +3951,32 @@ fn draw_text_area(
     let visible_lines =
         editor_visible_lines(app, first_visible_line, metrics, gui_state, state.word_wrap);
     draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
+    let composition_visible_index = (!gui_state.editor_ime_composition.is_empty())
+        .then(|| visible_line_index_for_caret(&visible_lines, state.caret_line, app.caret_offset()))
+        .flatten();
     for (index, line) in visible_lines.iter().enumerate() {
         let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
-        canvas.clipped_text(
-            TEXT_MARGIN_X,
-            y,
-            &line.text,
-            COLOR_TEXT,
-            TextRole::Editor,
-            fonts,
-            metrics.editor_text_width,
-        );
+        if Some(index) == composition_visible_index {
+            draw_editor_line_with_composition(
+                canvas,
+                fonts,
+                line,
+                app.caret_offset(),
+                &gui_state.editor_ime_composition,
+                y,
+                metrics.editor_text_width,
+            );
+        } else {
+            canvas.clipped_text(
+                TEXT_MARGIN_X,
+                y,
+                &line.text,
+                COLOR_TEXT,
+                TextRole::Editor,
+                fonts,
+                metrics.editor_text_width,
+            );
+        }
     }
 
     if visible_lines.is_empty() {
@@ -3738,10 +3992,84 @@ fn draw_text_area(
         let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
         let visible_prefix =
             text_prefix_for_width(fonts, prefix, TextRole::Editor, metrics.editor_text_width);
-        let caret_x = (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor))
-            .min(TEXT_MARGIN_X + metrics.editor_text_width);
+        let composition_width = if Some(visible_index) == composition_visible_index {
+            fonts.measure(&gui_state.editor_ime_composition, TextRole::Editor)
+        } else {
+            0
+        };
+        let caret_x =
+            (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor) + composition_width)
+                .min(TEXT_MARGIN_X + metrics.editor_text_width);
         let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
         draw_caret(canvas, caret_x, y);
+    }
+}
+
+fn draw_editor_line_with_composition(
+    canvas: &mut Canvas,
+    fonts: &FontStack,
+    line: &VisibleLine,
+    caret_offset: usize,
+    composition: &str,
+    y: usize,
+    max_width: usize,
+) {
+    let local_offset = caret_offset
+        .saturating_sub(line.byte_range.start)
+        .min(line.text.len());
+    let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
+    let suffix = line.text.get(local_offset..).unwrap_or("");
+    let prefix = text_prefix_for_width(fonts, prefix, TextRole::Editor, max_width);
+    let prefix_width = fonts.measure(prefix, TextRole::Editor).min(max_width);
+
+    canvas.clipped_text(
+        TEXT_MARGIN_X,
+        y,
+        prefix,
+        COLOR_TEXT,
+        TextRole::Editor,
+        fonts,
+        max_width,
+    );
+
+    let composition_x = TEXT_MARGIN_X + prefix_width;
+    let remaining_width = max_width.saturating_sub(prefix_width);
+    let visible_composition =
+        text_prefix_for_width(fonts, composition, TextRole::Editor, remaining_width);
+    let composition_width = fonts
+        .measure(visible_composition, TextRole::Editor)
+        .min(remaining_width);
+    if composition_width > 0 {
+        canvas.fill_rect(
+            composition_x,
+            y,
+            composition_width.max(1),
+            EDITOR_LINE_HEIGHT,
+            COLOR_SELECTION,
+        );
+        canvas.clipped_text(
+            composition_x,
+            y,
+            visible_composition,
+            COLOR_TEXT,
+            TextRole::Editor,
+            fonts,
+            remaining_width,
+        );
+    }
+
+    let suffix_x = composition_x + composition_width;
+    let suffix_width = max_width.saturating_sub(prefix_width + composition_width);
+    if suffix_width > 0 {
+        canvas.clipped_text(
+            suffix_x,
+            y,
+            suffix,
+            COLOR_TEXT,
+            TextRole::Editor,
+            fonts,
+            suffix_width,
+        );
     }
 }
 
@@ -5566,6 +5894,23 @@ mod tests {
     }
 
     #[test]
+    fn pending_text_input_suppresses_command_shortcuts() {
+        assert!(should_handle_command_shortcuts(true, false, false));
+        assert!(!should_handle_command_shortcuts(true, true, false));
+        assert!(!should_handle_command_shortcuts(true, false, true));
+        assert!(!should_handle_command_shortcuts(false, false, false));
+    }
+
+    #[test]
+    fn input_queue_has_text_ignores_control_characters() {
+        let queue = Rc::new(RefCell::new(vec!['\u{1}', 'a']));
+        assert!(input_queue_has_text(&queue));
+
+        *queue.borrow_mut() = vec!['\u{1}', '\n'];
+        assert!(!input_queue_has_text(&queue));
+    }
+
+    #[test]
     fn text_units_keep_emoji_zwj_sequence_together() {
         let units = text_units("🙆‍♂️a").collect::<Vec<_>>();
 
@@ -6076,6 +6421,77 @@ mod tests {
     }
 
     #[test]
+    fn find_textbox_ascii_fallback_is_disabled_while_ime_is_open() {
+        assert!(should_use_find_ascii_fallback(true, false, false));
+        assert!(!should_use_find_ascii_fallback(true, false, true));
+        assert!(!should_use_find_ascii_fallback(true, true, false));
+        assert!(!should_use_find_ascii_fallback(false, false, false));
+    }
+
+    #[test]
+    fn find_ime_position_tracks_query_caret() {
+        let fonts = FontStack::load().expect("fonts");
+
+        let empty_x = find_ime_caret_x(&fonts, "");
+        let text_x = find_ime_caret_x(&fonts, "kakikukeko");
+        let long_x = find_ime_caret_x(&fonts, &"x".repeat(512));
+
+        assert_eq!(empty_x, FIND_FIELD_RECT.x + 6);
+        assert_eq!(
+            find_ime_caret_y(),
+            centered_text_y(FIND_FIELD_RECT, TextRole::Find)
+        );
+        assert!(find_ime_caret_y() < FIND_FIELD_RECT.y + FIND_FIELD_RECT.height);
+        assert!(text_x > empty_x);
+        assert!(long_x <= FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4);
+    }
+
+    #[test]
+    fn editor_ime_position_tracks_editor_caret() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("abcdef").expect("insert");
+        app.set_caret_offset(3).expect("caret");
+        let gui_state = GuiState::new().expect("gui state");
+
+        let (x, y) = editor_ime_caret_point(&app, &gui_state, 640, 400).expect("ime point");
+
+        assert!(x > TEXT_MARGIN_X);
+        assert_eq!(y, text_top() + TEXT_MARGIN_Y);
+    }
+
+    #[test]
+    fn editor_ime_position_tracks_wrapped_visual_row() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"abcdef ".repeat(24)).expect("insert");
+        let gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 220).expect("metrics");
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, true);
+        assert!(rows.len() > 1);
+        app.set_caret_offset(rows[1].byte_range.start)
+            .expect("caret");
+
+        let (_x, y) = editor_ime_caret_point(&app, &gui_state, 220, 220).expect("ime point");
+
+        assert_eq!(y, metrics.text_top + TEXT_MARGIN_Y + EDITOR_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn editor_ime_composition_is_drawn_inline_at_caret() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("abcdef").expect("insert");
+        app.set_caret_offset(3).expect("caret");
+        let mut gui_state = GuiState::new().expect("gui state");
+        gui_state.editor_ime_composition = "てすと".to_owned();
+        let state = app.ui_state().expect("ui state");
+
+        let frame = render_frame_with_state(&app, &state, 640, 240, &gui_state).expect("render");
+
+        assert!(frame.pixels.iter().any(|pixel| *pixel == COLOR_SELECTION));
+    }
+
+    #[test]
     fn find_textbox_paste_appends_clipboard_text() {
         let mut query = "prefix ".to_owned();
         let mut clipboard_cache = String::new();
@@ -6271,6 +6687,50 @@ mod tests {
         assert!(gui_state.first_visible_line > 0);
         assert_eq!(after[0].number, 1);
         assert!(after[0].byte_range.start > before[0].byte_range.start);
+    }
+
+    #[test]
+    fn word_wrap_vertical_scroll_reaches_beyond_first_long_line_chunk() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"abcdef ".repeat(8_000)).expect("insert");
+        let mut gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 180).expect("metrics");
+        let total_rows = vertical_content_len(&app, &gui_state, metrics);
+
+        gui_state.scroll_vertical(&app, total_rows as isize, metrics);
+        let rows = editor_visible_lines(
+            &app,
+            gui_state.first_visible_line,
+            metrics,
+            &gui_state,
+            true,
+        );
+
+        assert_eq!(app.document().line_count(), 1);
+        assert!(total_rows > metrics.visible_line_count);
+        assert!(rows[0].byte_range.start > 16 * 1024);
+        assert_eq!(rows[0].number, 1);
+    }
+
+    #[test]
+    fn reset_scroll_clears_wrapped_row_cache_for_new_one_line_document() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text("short").expect("insert short");
+        let mut gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 180).expect("metrics");
+        assert_eq!(vertical_content_len(&app, &gui_state, metrics), 1);
+
+        app.new_document();
+        app.insert_text(&"abcdef ".repeat(96)).expect("insert long");
+        gui_state.reset_scroll(&app);
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 180).expect("metrics");
+
+        assert!(vertical_content_len(&app, &gui_state, metrics) > metrics.visible_line_count);
     }
 
     #[test]
