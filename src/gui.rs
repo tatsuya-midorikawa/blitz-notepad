@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::BufWriter;
+#[cfg(target_os = "windows")]
+use std::num::NonZeroIsize;
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
@@ -17,6 +19,11 @@ use ab_glyph::{point, Font, FontArc, FontVec, GlyphId as AbGlyphId, PxScale, Sca
 use arboard::Clipboard;
 use fontdb::{Database, Family, Query};
 use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use pixels::raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
+};
+use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use swash::{
     scale::{image::Content, Render, ScaleContext, Source, StrikeWith},
@@ -25,6 +32,7 @@ use swash::{
     FontRef, GlyphId as SwashGlyphId,
 };
 
+use crate::document::VisibleLine;
 use crate::ui::{MenuItem, NotepadUiState, MENU_BAR};
 use crate::{BlitzApp, BlitzError, Document, Result};
 
@@ -132,6 +140,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
     window.set_input_callback(Box::new(TextInput::new(Rc::clone(&input_queue))));
     let mut remaining_frames = options.smoke_frames;
     let mut frame_cache: Option<CachedFrame> = None;
+    let mut presenter = FramePresenter::new(&window, DEFAULT_WIDTH, DEFAULT_HEIGHT);
     let mut last_title = String::new();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
@@ -167,9 +176,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
             .as_ref()
             .expect("frame cache is initialized")
             .frame;
-        window
-            .update_with_buffer(&frame.pixels, frame.width, frame.height)
-            .map_err(|error| BlitzError::Window(error.to_string()))?;
+        presenter.present(&mut window, frame)?;
         let title = state.title();
         if title != last_title {
             window.set_title(&title);
@@ -273,6 +280,11 @@ impl GuiState {
     }
 
     fn clamp_horizontal(&mut self, app: &BlitzApp, visible_lines: usize) {
+        if app.settings().word_wrap {
+            self.horizontal_offset = 0;
+            return;
+        }
+
         self.horizontal_offset = self.horizontal_offset.min(max_visible_line_len(
             app,
             self.first_visible_line,
@@ -306,15 +318,17 @@ impl GuiState {
                 .first_visible_line
                 .min(max_first_visible_line(app, metrics.visible_line_count));
 
-            let visible_line =
-                app.document()
-                    .visible_lines_at(caret_line, 1, self.horizontal_offset);
-            if let Some(line) = visible_line.first() {
-                if app.caret_offset() < line.byte_range.start
-                    || app.caret_offset() > line.byte_range.end
-                {
-                    let line_start = app.document().line_start(caret_line).unwrap_or(0);
-                    self.horizontal_offset = app.caret_offset().saturating_sub(line_start);
+            if !app.settings().word_wrap {
+                let visible_line =
+                    app.document()
+                        .visible_lines_at(caret_line, 1, self.horizontal_offset);
+                if let Some(line) = visible_line.first() {
+                    if app.caret_offset() < line.byte_range.start
+                        || app.caret_offset() > line.byte_range.end
+                    {
+                        let line_start = app.document().line_start(caret_line).unwrap_or(0);
+                        self.horizontal_offset = app.caret_offset().saturating_sub(line_start);
+                    }
                 }
             }
             self.clamp_horizontal(app, metrics.visible_line_count);
@@ -362,6 +376,11 @@ impl GuiState {
         let selection_end = selection.end.min(content_range.end).max(selection_start);
         let relative_start = selection_start.saturating_sub(content_range.start);
         let relative_end = selection_end.saturating_sub(content_range.start);
+        if app.settings().word_wrap {
+            self.horizontal_offset = 0;
+            return Ok(());
+        }
+
         let visible_bytes = visible_byte_capacity(&self.fonts, metrics.editor_text_width);
         self.horizontal_offset =
             centered_offset_for_range(relative_start, relative_end, visible_bytes);
@@ -395,6 +414,181 @@ enum PrintOutcome {
 struct PrintRequest {
     document: Document,
     title: String,
+}
+
+enum FramePresenter {
+    Gpu(GpuPresenter),
+    Software,
+}
+
+impl FramePresenter {
+    fn new(window: &Window, width: usize, height: usize) -> Self {
+        GpuPresenter::new(window, width, height)
+            .map(Self::Gpu)
+            .unwrap_or_else(|error| {
+                eprintln!("blitzpad: {error}; using software presentation");
+                Self::Software
+            })
+    }
+
+    fn present(&mut self, window: &mut Window, frame: &RenderFrame) -> Result<()> {
+        if let Self::Gpu(gpu) = self {
+            match gpu.present(frame) {
+                Ok(()) => {
+                    // GPU presentation owns the pixels surface; minifb still needs update() for input/state polling.
+                    window.update();
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!("blitzpad: {error}; falling back to software presentation");
+                    *self = Self::Software;
+                }
+            }
+        }
+
+        window
+            .update_with_buffer(&frame.pixels, frame.width, frame.height)
+            .map_err(|error| BlitzError::Window(error.to_string()))
+    }
+}
+
+struct GpuPresenter {
+    // pixels owns GpuWindowHandle, which contains copied OS handles. run_window declares presenter
+    // after window, so Rust drops presenter before window and the captured handles remain valid.
+    pixels: Pixels<'static>,
+    width: usize,
+    height: usize,
+}
+
+impl GpuPresenter {
+    fn new(window: &Window, width: usize, height: usize) -> Result<Self> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let handle = GpuWindowHandle::capture(window)?;
+        let surface = SurfaceTexture::new(width as u32, height as u32, handle);
+        let pixels = PixelsBuilder::new(width as u32, height as u32, surface)
+            .request_adapter_options(pixels::wgpu::RequestAdapterOptions {
+                power_preference: pixels::wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .device_descriptor(pixels::wgpu::DeviceDescriptor {
+                label: Some("blitzpad-gpu-presenter"),
+                required_limits: pixels::wgpu::Limits::downlevel_defaults(),
+                ..Default::default()
+            })
+            .enable_vsync(true)
+            .build()
+            .map_err(|error| BlitzError::Window(format!("GPU presenter unavailable: {error}")))?;
+
+        Ok(Self {
+            pixels,
+            width,
+            height,
+        })
+    }
+
+    fn present(&mut self, frame: &RenderFrame) -> Result<()> {
+        self.resize(frame.width.max(1), frame.height.max(1))?;
+        copy_frame_to_rgba(frame, self.pixels.frame_mut())?;
+        self.pixels
+            .render()
+            .map_err(|error| BlitzError::Window(format!("GPU present failed: {error}")))
+    }
+
+    fn resize(&mut self, width: usize, height: usize) -> Result<()> {
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+
+        let width_u32 = width as u32;
+        let height_u32 = height as u32;
+        self.pixels
+            .resize_surface(width_u32, height_u32)
+            .map_err(|error| BlitzError::Window(format!("GPU surface resize failed: {error}")))?;
+        self.pixels
+            .resize_buffer(width_u32, height_u32)
+            .map_err(|error| BlitzError::Window(format!("GPU buffer resize failed: {error}")))?;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GpuWindowHandle {
+    display: RawDisplayHandle,
+    window: RawWindowHandle,
+}
+
+// Raw window/display handles are pointer-sized identifiers that wgpu may move across helper threads.
+unsafe impl Send for GpuWindowHandle {}
+// They are immutable copies, and GpuPresenter's drop-before-Window invariant keeps them live.
+unsafe impl Sync for GpuWindowHandle {}
+
+impl GpuWindowHandle {
+    #[cfg(target_os = "windows")]
+    fn capture(window: &Window) -> Result<Self> {
+        // minifb 0.27's Windows HasWindowHandle implementation dereferences HWND incorrectly here,
+        // so use the public native handle directly and wrap the pointer value for raw-window-handle.
+        let hwnd = NonZeroIsize::new(window.get_window_handle() as isize)
+            .ok_or_else(|| BlitzError::Window("window handle unavailable".to_owned()))?;
+        let display = RawDisplayHandle::Windows(WindowsDisplayHandle::new());
+        let window = RawWindowHandle::Win32(Win32WindowHandle::new(hwnd));
+        Ok(Self { display, window })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn capture(window: &Window) -> Result<Self> {
+        let display = window
+            .display_handle()
+            .map_err(|error| BlitzError::Window(format!("display handle unavailable: {error}")))?
+            .as_raw();
+        let window = window
+            .window_handle()
+            .map_err(|error| BlitzError::Window(format!("window handle unavailable: {error}")))?
+            .as_raw();
+        Ok(Self { display, window })
+    }
+}
+
+impl HasDisplayHandle for GpuWindowHandle {
+    fn display_handle(&self) -> std::result::Result<DisplayHandle<'_>, HandleError> {
+        // The raw handles were captured from the live minifb window and this presenter is dropped first.
+        Ok(unsafe { DisplayHandle::borrow_raw(self.display) })
+    }
+}
+
+impl HasWindowHandle for GpuWindowHandle {
+    fn window_handle(&self) -> std::result::Result<WindowHandle<'_>, HandleError> {
+        // The raw handles were captured from the live minifb window and this presenter is dropped first.
+        Ok(unsafe { WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+fn copy_frame_to_rgba(frame: &RenderFrame, output: &mut [u8]) -> Result<()> {
+    let expected_len = frame
+        .width
+        .checked_mul(frame.height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(usize::MAX);
+    if output.len() != expected_len || frame.pixels.len().saturating_mul(4) != expected_len {
+        return Err(BlitzError::Window(format!(
+            "GPU frame upload size mismatch: frame={}x{} pixels={} rgba={}",
+            frame.width,
+            frame.height,
+            frame.pixels.len(),
+            output.len()
+        )));
+    }
+
+    for (pixel, rgba) in frame.pixels.iter().zip(output.chunks_exact_mut(4)) {
+        rgba[0] = ((pixel >> 16) & 0xff) as u8;
+        rgba[1] = ((pixel >> 8) & 0xff) as u8;
+        rgba[2] = (pixel & 0xff) as u8;
+        rgba[3] = 0xff;
+    }
+    Ok(())
 }
 
 struct FindWindowState {
@@ -3476,10 +3670,13 @@ fn draw_text_area(
     let first_visible_line = gui_state
         .first_visible_line
         .min(max_first_visible_line(app, metrics.visible_line_count));
-    let visible_lines = app.document().visible_lines_at(
+    let visible_lines = editor_visible_lines(
+        app,
         first_visible_line,
-        metrics.visible_line_count,
-        gui_state.horizontal_offset,
+        metrics,
+        gui_state,
+        fonts,
+        state.word_wrap,
     );
     draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
     for (index, line) in visible_lines.iter().enumerate() {
@@ -3497,12 +3694,11 @@ fn draw_text_area(
 
     if visible_lines.is_empty() {
         draw_caret(canvas, TEXT_MARGIN_X, metrics.text_top + TEXT_MARGIN_Y);
-    } else if let Some(visible_index) = state
-        .caret_line
-        .checked_sub(1)
-        .and_then(|line| line.checked_sub(first_visible_line))
-        .filter(|index| *index < visible_lines.len())
-    {
+    } else if let Some(visible_index) = visible_lines.iter().position(|line| {
+        line.number == state.caret_line
+            && app.caret_offset() >= line.byte_range.start
+            && app.caret_offset() <= line.byte_range.end
+    }) {
         let line = &visible_lines[visible_index];
         let local_offset = app
             .caret_offset()
@@ -3518,10 +3714,116 @@ fn draw_text_area(
     }
 }
 
+fn editor_visible_lines(
+    app: &BlitzApp,
+    first_visible_line: usize,
+    metrics: EditorMetrics,
+    gui_state: &GuiState,
+    fonts: &FontStack,
+    word_wrap: bool,
+) -> Vec<VisibleLine> {
+    if !word_wrap {
+        return app.document().visible_lines_at(
+            first_visible_line,
+            metrics.visible_line_count,
+            gui_state.horizontal_offset,
+        );
+    }
+
+    wrapped_visible_lines(
+        app,
+        first_visible_line,
+        metrics.visible_line_count,
+        fonts,
+        metrics.editor_text_width,
+    )
+}
+
+fn wrapped_visible_lines(
+    app: &BlitzApp,
+    first_visible_line: usize,
+    max_rows: usize,
+    fonts: &FontStack,
+    max_width: usize,
+) -> Vec<VisibleLine> {
+    let mut rows = Vec::with_capacity(max_rows);
+    let mut document_line = first_visible_line;
+    let line_count = app.document().line_count();
+
+    while rows.len() < max_rows && document_line < line_count {
+        let Some(line) = app
+            .document()
+            .visible_lines_at(document_line, 1, 0)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        append_wrapped_line_segments(&mut rows, line, max_rows, fonts, max_width);
+        document_line += 1;
+    }
+
+    rows
+}
+
+fn append_wrapped_line_segments(
+    rows: &mut Vec<VisibleLine>,
+    line: VisibleLine,
+    max_rows: usize,
+    fonts: &FontStack,
+    max_width: usize,
+) {
+    if line.text.is_empty() {
+        rows.push(line);
+        return;
+    }
+
+    let mut segment_start = 0usize;
+    while segment_start < line.text.len() && rows.len() < max_rows {
+        let segment_end = wrapped_segment_end(fonts, &line.text, segment_start, max_width);
+        debug_assert!(segment_end > segment_start);
+        let text = line.text[segment_start..segment_end].to_owned();
+        rows.push(VisibleLine {
+            number: line.number,
+            byte_range: line.byte_range.start + segment_start..line.byte_range.start + segment_end,
+            text,
+        });
+        segment_start = segment_end;
+    }
+}
+
+fn wrapped_segment_end(
+    fonts: &FontStack,
+    text: &str,
+    segment_start: usize,
+    max_width: usize,
+) -> usize {
+    let limit = max_width.max(1) as f32;
+    let mut width = 0.0f32;
+    let mut last_end = segment_start;
+
+    for unit in text_units(&text[segment_start..]) {
+        let absolute_start = segment_start + unit.start;
+        let absolute_end = segment_start + unit.end;
+        let advance = fonts.measure_unit(unit, TextRole::Editor);
+        if width + advance > limit {
+            return if absolute_start == segment_start {
+                absolute_end
+            } else {
+                last_end
+            };
+        }
+        width += advance;
+        last_end = absolute_end;
+    }
+
+    text.len()
+}
+
 fn draw_selection_highlights(
     canvas: &mut Canvas,
     app: &BlitzApp,
-    visible_lines: &[crate::document::VisibleLine],
+    visible_lines: &[VisibleLine],
     metrics: EditorMetrics,
     fonts: &FontStack,
 ) {
@@ -3600,15 +3902,15 @@ fn text_offset_for_point(
     let first_visible_line = gui_state
         .first_visible_line
         .min(max_first_visible_line(app, metrics.visible_line_count));
-    let document_line = first_visible_line
-        .saturating_add(line_index)
-        .min(app.document().line_count().saturating_sub(1));
-    let visible_line = app
-        .document()
-        .visible_lines_at(document_line, 1, gui_state.horizontal_offset)
-        .into_iter()
-        .next();
-    let Some(line) = visible_line else {
+    let visible_lines = editor_visible_lines(
+        app,
+        first_visible_line,
+        metrics,
+        gui_state,
+        &gui_state.fonts,
+        app.settings().word_wrap,
+    );
+    let Some(line) = visible_lines.get(line_index) else {
         return Some(0);
     };
     let target_x = x.saturating_sub(TEXT_MARGIN_X) as f32;
@@ -3623,6 +3925,7 @@ fn text_offset_for_point(
 fn offset_for_x(fonts: &FontStack, line: &str, line_start: usize, target_x: f32) -> usize {
     let mut cursor = 0.0f32;
     for unit in text_units(line) {
+        // TextUnit boundaries come from char_indices and emoji cluster parsing, so offsets stay UTF-8 safe.
         let advance = fonts.measure_unit(unit, TextRole::Editor);
         if target_x < cursor + advance / 2.0 {
             return line_start + unit.start;
@@ -4711,6 +5014,32 @@ mod tests {
     }
 
     #[test]
+    fn gpu_frame_upload_converts_0rgb_pixels_to_rgba() {
+        let frame = RenderFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0x00123456, 0x00abcdef],
+        };
+        let mut rgba = vec![0; frame.width * frame.height * 4];
+
+        copy_frame_to_rgba(&frame, &mut rgba).expect("convert frame");
+
+        assert_eq!(rgba, vec![0x12, 0x34, 0x56, 0xff, 0xab, 0xcd, 0xef, 0xff]);
+    }
+
+    #[test]
+    fn gpu_frame_upload_rejects_mismatched_buffer_size() {
+        let frame = RenderFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0x00123456, 0x00abcdef],
+        };
+        let mut rgba = vec![0; 4];
+
+        assert!(copy_frame_to_rgba(&frame, &mut rgba).is_err());
+    }
+
+    #[test]
     fn mouse_point_maps_to_document_offset() {
         let mut gui_state = GuiState::new().expect("gui state");
         let mut app = BlitzApp::new(EditorSettings::default());
@@ -5490,6 +5819,73 @@ mod tests {
         assert!(prefix.len() < text.len());
         assert!(fonts.measure(prefix, TextRole::Editor) <= max_width);
         assert!(text.is_char_boundary(prefix.len()));
+    }
+
+    #[test]
+    fn word_wrap_splits_long_editor_line_into_visible_rows() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"abcdef ".repeat(24)).expect("insert");
+        let gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 220).expect("metrics");
+
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, &gui_state.fonts, true);
+
+        assert!(rows.len() > 1);
+        assert_eq!(rows[0].number, 1);
+        assert_eq!(rows[1].number, 1);
+        assert_eq!(rows[0].byte_range.end, rows[1].byte_range.start);
+        assert!(
+            gui_state.fonts.measure(&rows[0].text, TextRole::Editor) <= metrics.editor_text_width
+        );
+    }
+
+    #[test]
+    fn word_wrap_keeps_multibyte_and_emoji_boundaries_intact() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"日本語🙆‍♂️😀".repeat(12))
+            .expect("insert multilingual text");
+        let gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 240, 260).expect("metrics");
+        let document_text = app.document().text_lossy();
+
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, &gui_state.fonts, true);
+
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| !row.text.contains('\u{fffd}')));
+        assert!(rows
+            .iter()
+            .all(|row| document_text.is_char_boundary(row.byte_range.start)));
+        assert!(rows
+            .iter()
+            .all(|row| document_text.is_char_boundary(row.byte_range.end)));
+    }
+
+    #[test]
+    fn word_wrap_hit_testing_uses_wrapped_visual_row() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.toggle_word_wrap();
+        app.insert_text(&"abcdef ".repeat(24)).expect("insert");
+        let gui_state = GuiState::new().expect("gui state");
+        let state = app.ui_state().expect("ui state");
+        let metrics = editor_metrics(&state, 220, 220).expect("metrics");
+        let rows = editor_visible_lines(&app, 0, metrics, &gui_state, &gui_state.fonts, true);
+        assert!(rows.len() > 1);
+
+        let offset = text_offset_for_point(
+            &app,
+            &gui_state,
+            220,
+            220,
+            TEXT_MARGIN_X,
+            metrics.text_top + TEXT_MARGIN_Y + EDITOR_LINE_HEIGHT,
+        )
+        .expect("offset");
+
+        assert!(rows[1].byte_range.contains(&offset) || offset == rows[1].byte_range.end);
     }
 
     #[test]
