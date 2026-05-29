@@ -657,6 +657,7 @@ struct FindWindowState {
     wrap_around: bool,
     forward: bool,
     mouse_was_down: bool,
+    ime_composition: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -665,6 +666,7 @@ struct FindWindowView {
     match_case: bool,
     wrap_around: bool,
     forward: bool,
+    ime_composition: String,
 }
 
 impl FindWindowState {
@@ -674,6 +676,7 @@ impl FindWindowState {
             match_case: self.match_case,
             wrap_around: self.wrap_around,
             forward: self.forward,
+            ime_composition: self.ime_composition.clone(),
         }
     }
 }
@@ -1176,11 +1179,13 @@ fn open_find_window(app: &BlitzApp, gui_state: &mut GuiState) -> Result<()> {
         wrap_around,
         forward: true,
         mouse_was_down: false,
+        ime_composition: String::new(),
     });
     if let Some(find_window) = gui_state.find_window.as_mut() {
         find_window
             .window
             .set_input_callback(Box::new(TextInput::new(input_queue)));
+        install_find_ime_ui_filter(&find_window.window);
     }
     Ok(())
 }
@@ -1190,6 +1195,7 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
         return Ok(());
     };
 
+    update_find_ime_composition(&mut find_window);
     position_find_ime_window(find_window, &gui_state.fonts);
     let frame = render_find_window(&find_window, &gui_state.fonts);
     find_window
@@ -1216,6 +1222,7 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
         );
     }
     if keep_open {
+        update_find_ime_composition(&mut find_window);
         position_find_ime_window(find_window, &gui_state.fonts);
         let frame = render_find_window(&find_window, &gui_state.fonts);
         find_window
@@ -1224,6 +1231,7 @@ fn handle_find_window(app: &mut BlitzApp, gui_state: &mut GuiState) -> Result<()
             .map_err(|error| BlitzError::Window(error.to_string()))?;
     } else {
         gui_state.find_window = None;
+        reset_find_ime_ui_filter();
     }
     Ok(())
 }
@@ -1326,21 +1334,32 @@ fn ime_is_open(_window: &Window) -> bool {
 
 #[cfg(target_os = "windows")]
 fn position_find_ime_window(find_window: &FindWindowState, fonts: &FontStack) {
-    let x = find_ime_caret_x(fonts, &find_window.query);
-    position_ime_composition_window(&find_window.window, x, find_ime_caret_y());
+    let x =
+        find_ime_caret_x_with_composition(fonts, &find_window.query, &find_window.ime_composition);
+    let y = find_ime_caret_y();
+    position_ime_composition_window(&find_window.window, x, y);
+    if !find_window.ime_composition.is_empty() {
+        position_ime_candidate_window(&find_window.window, x, y);
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn position_find_ime_window(_find_window: &FindWindowState, _fonts: &FontStack) {}
 
 fn find_ime_caret_x(fonts: &FontStack, query: &str) -> usize {
-    let visible = text_prefix_for_width(
-        fonts,
-        query,
-        TextRole::Find,
-        FIND_FIELD_RECT.width.saturating_sub(12),
-    );
-    (FIND_FIELD_RECT.x + 6 + fonts.measure(visible, TextRole::Find))
+    find_ime_caret_x_with_composition(fonts, query, "")
+}
+
+fn find_ime_caret_x_with_composition(fonts: &FontStack, query: &str, composition: &str) -> usize {
+    let available = FIND_FIELD_RECT.width.saturating_sub(12);
+    let visible_query = text_prefix_for_width(fonts, query, TextRole::Find, available);
+    let query_width = fonts.measure(visible_query, TextRole::Find).min(available);
+    let remaining = available.saturating_sub(query_width);
+    let visible_composition = text_prefix_for_width(fonts, composition, TextRole::Find, remaining);
+    let composition_width = fonts
+        .measure(visible_composition, TextRole::Find)
+        .min(remaining);
+    (FIND_FIELD_RECT.x + 6 + query_width + composition_width)
         .min(FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4)
 }
 
@@ -1352,28 +1371,52 @@ fn find_ime_caret_y() -> usize {
 static EDITOR_ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 
 #[cfg(target_os = "windows")]
-fn install_editor_ime_ui_filter(window: &Window) {
-    let Some(hwnd) = window_hwnd(window) else {
-        return;
-    };
-    if EDITOR_ORIGINAL_WNDPROC.load(Ordering::SeqCst) != 0 {
-        return;
-    }
+static FIND_ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 
-    unsafe {
-        let previous = SetWindowLongPtrW(
-            hwnd,
-            GWLP_WNDPROC,
-            editor_ime_filter_wnd_proc as *const () as isize,
-        );
-        if previous != 0 {
-            EDITOR_ORIGINAL_WNDPROC.store(previous, Ordering::SeqCst);
-        }
-    }
+#[cfg(target_os = "windows")]
+fn install_editor_ime_ui_filter(window: &Window) {
+    install_ime_ui_filter(window, &EDITOR_ORIGINAL_WNDPROC, editor_ime_filter_wnd_proc);
 }
 
 #[cfg(not(target_os = "windows"))]
 fn install_editor_ime_ui_filter(_window: &Window) {}
+
+#[cfg(target_os = "windows")]
+fn install_find_ime_ui_filter(window: &Window) {
+    install_ime_ui_filter(window, &FIND_ORIGINAL_WNDPROC, find_ime_filter_wnd_proc);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_find_ime_ui_filter(_window: &Window) {}
+
+#[cfg(target_os = "windows")]
+fn reset_find_ime_ui_filter() {
+    FIND_ORIGINAL_WNDPROC.store(0, Ordering::SeqCst);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reset_find_ime_ui_filter() {}
+
+#[cfg(target_os = "windows")]
+fn install_ime_ui_filter(
+    window: &Window,
+    slot: &AtomicIsize,
+    proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    if slot.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    unsafe {
+        let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as *const () as isize);
+        if previous != 0 {
+            slot.store(previous, Ordering::SeqCst);
+        }
+    }
+}
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn editor_ime_filter_wnd_proc(
@@ -1382,12 +1425,33 @@ unsafe extern "system" fn editor_ime_filter_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    apply_ime_wnd_proc_filter(hwnd, message, wparam, lparam, &EDITOR_ORIGINAL_WNDPROC)
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn find_ime_filter_wnd_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    apply_ime_wnd_proc_filter(hwnd, message, wparam, lparam, &FIND_ORIGINAL_WNDPROC)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_ime_wnd_proc_filter(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    slot: &AtomicIsize,
+) -> LRESULT {
     match classify_editor_ime_wnd_proc_message(message, lparam) {
         Some(EditorImeWndProcAction::Forward(forward_lparam)) => {
-            call_original_editor_wnd_proc(hwnd, message, wparam, forward_lparam)
+            call_original_ime_wnd_proc(hwnd, message, wparam, forward_lparam, slot)
         }
         Some(EditorImeWndProcAction::Consume) => 0,
-        None => call_original_editor_wnd_proc(hwnd, message, wparam, lparam),
+        None => call_original_ime_wnd_proc(hwnd, message, wparam, lparam, slot),
     }
 }
 
@@ -1423,13 +1487,14 @@ fn classify_editor_ime_wnd_proc_message(
 }
 
 #[cfg(target_os = "windows")]
-fn call_original_editor_wnd_proc(
+fn call_original_ime_wnd_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
+    slot: &AtomicIsize,
 ) -> LRESULT {
-    let previous = EDITOR_ORIGINAL_WNDPROC.load(Ordering::SeqCst);
+    let previous = slot.load(Ordering::SeqCst);
     if previous == 0 {
         return 0;
     }
@@ -1470,6 +1535,10 @@ fn update_editor_ime_state(
             position_ime_candidate_window(window, x, y);
         }
     }
+}
+
+fn update_find_ime_composition(find_window: &mut FindWindowState) {
+    find_window.ime_composition = ime_composition_text(&find_window.window).unwrap_or_default();
 }
 
 fn editor_ime_caret_point(
@@ -2008,7 +2077,7 @@ fn render_find_window_view(view: &FindWindowView, fonts: &FontStack) -> RenderFr
         TextRole::Find,
         fonts,
     );
-    draw_find_text_field(&mut canvas, fonts, &view.query);
+    draw_find_text_field(&mut canvas, fonts, &view.query, &view.ime_composition);
     draw_find_button(
         &mut canvas,
         fonts,
@@ -2044,7 +2113,7 @@ fn render_find_window_view(view: &FindWindowView, fonts: &FontStack) -> RenderFr
     canvas.into_frame()
 }
 
-fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str) {
+fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str, composition: &str) {
     canvas.fill_rect(
         FIND_FIELD_RECT.x,
         FIND_FIELD_RECT.y,
@@ -2059,22 +2128,45 @@ fn draw_find_text_field(canvas: &mut Canvas, fonts: &FontStack, query: &str) {
         FIND_FIELD_RECT.height,
         COLOR_FOCUS_BORDER,
     );
-    let visible = text_prefix_for_width(
-        fonts,
-        query,
-        TextRole::Find,
-        FIND_FIELD_RECT.width.saturating_sub(12),
-    );
+    let available_width = FIND_FIELD_RECT.width.saturating_sub(12);
+    let visible_query = text_prefix_for_width(fonts, query, TextRole::Find, available_width);
+    let text_y = centered_text_y(FIND_FIELD_RECT, TextRole::Find);
     canvas.text(
         FIND_FIELD_RECT.x + 6,
-        centered_text_y(FIND_FIELD_RECT, TextRole::Find),
-        visible,
+        text_y,
+        visible_query,
         COLOR_TEXT,
         TextRole::Find,
         fonts,
     );
-    let caret_x = (FIND_FIELD_RECT.x + 6 + fonts.measure(visible, TextRole::Find))
-        .min(FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4);
+    let query_width = fonts
+        .measure(visible_query, TextRole::Find)
+        .min(available_width);
+    let composition_x = FIND_FIELD_RECT.x + 6 + query_width;
+    let remaining = available_width.saturating_sub(query_width);
+    let visible_composition = text_prefix_for_width(fonts, composition, TextRole::Find, remaining);
+    let composition_width = fonts
+        .measure(visible_composition, TextRole::Find)
+        .min(remaining);
+    if composition_width > 0 {
+        canvas.fill_rect(
+            composition_x,
+            FIND_FIELD_RECT.y + 4,
+            composition_width.max(1),
+            FIND_FIELD_RECT.height.saturating_sub(8),
+            COLOR_SELECTION,
+        );
+        canvas.text(
+            composition_x,
+            text_y,
+            visible_composition,
+            COLOR_TEXT,
+            TextRole::Find,
+            fonts,
+        );
+    }
+    let caret_x =
+        (composition_x + composition_width).min(FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4);
     canvas.fill_rect(
         caret_x,
         FIND_FIELD_RECT.y + 4,
@@ -6412,6 +6504,7 @@ mod tests {
             match_case: false,
             wrap_around: false,
             forward: true,
+            ime_composition: String::new(),
         };
 
         let frame = render_find_window_view(&view, &fonts);
@@ -6616,6 +6709,45 @@ mod tests {
         assert!(find_ime_caret_y() < FIND_FIELD_RECT.y + FIND_FIELD_RECT.height);
         assert!(text_x > empty_x);
         assert!(long_x <= FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4);
+    }
+
+    #[test]
+    fn find_ime_caret_x_advances_past_composition() {
+        let fonts = FontStack::load().expect("fonts");
+
+        let without = find_ime_caret_x_with_composition(&fonts, "abc", "");
+        let with = find_ime_caret_x_with_composition(&fonts, "abc", "かきくけこ");
+
+        assert!(with > without);
+        assert!(with <= FIND_FIELD_RECT.x + FIND_FIELD_RECT.width - 4);
+    }
+
+    #[test]
+    fn find_textbox_renders_inline_composition_with_selection_background() {
+        let fonts = FontStack::load().expect("fonts");
+        let with_composition = FindWindowView {
+            query: String::new(),
+            match_case: false,
+            wrap_around: false,
+            forward: true,
+            ime_composition: "かきくけこ".to_owned(),
+        };
+        let without = FindWindowView {
+            ime_composition: String::new(),
+            ..with_composition.clone()
+        };
+
+        let frame_with = render_find_window_view(&with_composition, &fonts);
+        let frame_without = render_find_window_view(&without, &fonts);
+
+        let count_selection = |frame: &RenderFrame| -> usize {
+            frame
+                .pixels
+                .iter()
+                .filter(|pixel| **pixel == COLOR_SELECTION)
+                .count()
+        };
+        assert!(count_selection(&frame_with) > count_selection(&frame_without));
     }
 
     #[test]
