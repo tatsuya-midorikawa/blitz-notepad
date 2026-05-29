@@ -8,6 +8,8 @@ use std::num::NonZeroIsize;
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
     Arc,
@@ -33,13 +35,19 @@ use swash::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{HWND, POINT, RECT},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     UI::Input::{
         Ime::{
             ImmGetCompositionStringW, ImmGetContext, ImmGetOpenStatus, ImmReleaseContext,
-            ImmSetCompositionWindow, CFS_FORCE_POSITION, COMPOSITIONFORM, GCS_COMPSTR,
+            ImmSetCandidateWindow, ImmSetCompositionWindow, CANDIDATEFORM, CFS_CANDIDATEPOS,
+            CFS_FORCE_POSITION, COMPOSITIONFORM, GCS_COMPSTR, GCS_RESULTSTR,
+            ISC_SHOWUICOMPOSITIONWINDOW, ISC_SHOWUIGUIDELINE,
         },
         KeyboardAndMouse::{GetKeyState, VK_CONTROL},
+    },
+    UI::WindowsAndMessaging::{
+        CallWindowProcW, SetWindowLongPtrW, GWLP_WNDPROC, WM_IME_COMPOSITION,
+        WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WNDPROC,
     },
 };
 
@@ -150,6 +158,7 @@ pub fn run_window(app: BlitzApp, options: GuiOptions) -> Result<()> {
 
     let input_queue = Rc::new(RefCell::new(Vec::new()));
     window.set_input_callback(Box::new(TextInput::new(Rc::clone(&input_queue))));
+    install_editor_ime_ui_filter(&window);
     let mut remaining_frames = options.smoke_frames;
     let mut frame_cache: Option<CachedFrame> = None;
     let mut presenter = FramePresenter::new(&window, DEFAULT_WIDTH, DEFAULT_HEIGHT);
@@ -761,6 +770,7 @@ struct FrameSignature {
     first_visible_line: usize,
     horizontal_offset: usize,
     selected_range: Option<std::ops::Range<usize>>,
+    editor_ime_composition: String,
 }
 
 #[derive(Clone, Debug)]
@@ -789,6 +799,7 @@ fn frame_signature(
         first_visible_line: gui_state.first_visible_line,
         horizontal_offset: gui_state.horizontal_offset,
         selected_range: app.selected_range(),
+        editor_ime_composition: gui_state.editor_ime_composition.clone(),
     }
 }
 
@@ -1337,6 +1348,106 @@ fn find_ime_caret_y() -> usize {
     centered_text_y(FIND_FIELD_RECT, TextRole::Find)
 }
 
+#[cfg(target_os = "windows")]
+static EDITOR_ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+
+#[cfg(target_os = "windows")]
+fn install_editor_ime_ui_filter(window: &Window) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    if EDITOR_ORIGINAL_WNDPROC.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    unsafe {
+        let previous = SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            editor_ime_filter_wnd_proc as *const () as isize,
+        );
+        if previous != 0 {
+            EDITOR_ORIGINAL_WNDPROC.store(previous, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_editor_ime_ui_filter(_window: &Window) {}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn editor_ime_filter_wnd_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match classify_editor_ime_wnd_proc_message(message, lparam) {
+        Some(EditorImeWndProcAction::Forward(forward_lparam)) => {
+            call_original_editor_wnd_proc(hwnd, message, wparam, forward_lparam)
+        }
+        Some(EditorImeWndProcAction::Consume) => 0,
+        None => call_original_editor_wnd_proc(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorImeWndProcAction {
+    Forward(LPARAM),
+    Consume,
+}
+
+#[cfg(target_os = "windows")]
+fn classify_editor_ime_wnd_proc_message(
+    message: u32,
+    lparam: LPARAM,
+) -> Option<EditorImeWndProcAction> {
+    match message {
+        WM_IME_SETCONTEXT => Some(EditorImeWndProcAction::Forward(
+            filter_ime_set_context_lparam(lparam),
+        )),
+        WM_IME_STARTCOMPOSITION | WM_IME_ENDCOMPOSITION => Some(EditorImeWndProcAction::Consume),
+        WM_IME_COMPOSITION => {
+            let result_flags = lparam & (GCS_RESULTSTR as LPARAM);
+            if result_flags != 0 {
+                // Forward with only the result-string bit so DefWindowProc emits WM_CHAR
+                // for committed text without redrawing the native composition window.
+                Some(EditorImeWndProcAction::Forward(result_flags))
+            } else {
+                Some(EditorImeWndProcAction::Consume)
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn call_original_editor_wnd_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let previous = EDITOR_ORIGINAL_WNDPROC.load(Ordering::SeqCst);
+    if previous == 0 {
+        return 0;
+    }
+
+    let previous_proc: WNDPROC = Some(unsafe { std::mem::transmute(previous) });
+    unsafe { CallWindowProcW(previous_proc, hwnd, message, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn filter_ime_set_context_lparam(lparam: LPARAM) -> LPARAM {
+    lparam & !ime_native_composition_ui_flags()
+}
+
+#[cfg(target_os = "windows")]
+fn ime_native_composition_ui_flags() -> LPARAM {
+    (ISC_SHOWUICOMPOSITIONWINDOW | ISC_SHOWUIGUIDELINE) as LPARAM
+}
+
 fn update_editor_ime_state(
     window: &Window,
     app: &BlitzApp,
@@ -1350,7 +1461,14 @@ fn update_editor_ime_state(
     }
     gui_state.editor_ime_composition = ime_composition_text(window).unwrap_or_default();
     if let Some((x, y)) = editor_ime_caret_point(app, gui_state, width, height) {
+        // Always anchor the native IME composition window to the caret. The WndProc
+        // filter clears ISC_SHOWUICOMPOSITIONWINDOW so the IME does not draw the
+        // composition text itself; the candidate window stays beside the caret
+        // because it is positioned relative to this composition point.
         position_ime_composition_window(window, x, y);
+        if !gui_state.editor_ime_composition.is_empty() {
+            position_ime_candidate_window(window, x, y);
+        }
     }
 }
 
@@ -1401,6 +1519,10 @@ fn editor_ime_caret_point(
 
 fn editor_ime_y(line_top: usize) -> usize {
     line_top + EDITOR_BASELINE_OFFSET
+}
+
+fn editor_ime_candidate_y(editor_ime_y: usize) -> usize {
+    editor_ime_y.saturating_add(4)
 }
 
 #[cfg(target_os = "windows")]
@@ -1465,6 +1587,36 @@ fn position_ime_composition_window(window: &Window, x: usize, y: usize) {
 
 #[cfg(not(target_os = "windows"))]
 fn position_ime_composition_window(_window: &Window, _x: usize, _y: usize) {}
+
+#[cfg(target_os = "windows")]
+fn position_ime_candidate_window(window: &Window, x: usize, y: usize) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.is_null() {
+            return;
+        }
+        for index in 0..4 {
+            let form = CANDIDATEFORM {
+                dwIndex: index,
+                dwStyle: CFS_CANDIDATEPOS,
+                ptCurrentPos: POINT {
+                    x: x as i32,
+                    y: editor_ime_candidate_y(y) as i32,
+                },
+                rcArea: RECT::default(),
+            };
+            ImmSetCandidateWindow(context, &form);
+        }
+        ImmReleaseContext(hwnd, context);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn position_ime_candidate_window(_window: &Window, _x: usize, _y: usize) {}
 
 #[cfg(target_os = "windows")]
 fn window_hwnd(window: &Window) -> Option<HWND> {
@@ -3970,17 +4122,32 @@ fn draw_text_area(
     let visible_lines =
         editor_visible_lines(app, first_visible_line, metrics, gui_state, state.word_wrap);
     draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
+    let composition_visible_index = (!gui_state.editor_ime_composition.is_empty())
+        .then(|| visible_line_index_for_caret(&visible_lines, state.caret_line, app.caret_offset()))
+        .flatten();
     for (index, line) in visible_lines.iter().enumerate() {
         let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
-        canvas.clipped_text(
-            TEXT_MARGIN_X,
-            y,
-            &line.text,
-            COLOR_TEXT,
-            TextRole::Editor,
-            fonts,
-            metrics.editor_text_width,
-        );
+        if Some(index) == composition_visible_index {
+            draw_editor_line_with_composition(
+                canvas,
+                fonts,
+                line,
+                app.caret_offset(),
+                &gui_state.editor_ime_composition,
+                y,
+                metrics.editor_text_width,
+            );
+        } else {
+            canvas.clipped_text(
+                TEXT_MARGIN_X,
+                y,
+                &line.text,
+                COLOR_TEXT,
+                TextRole::Editor,
+                fonts,
+                metrics.editor_text_width,
+            );
+        }
     }
 
     if visible_lines.is_empty() {
@@ -3996,10 +4163,84 @@ fn draw_text_area(
         let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
         let visible_prefix =
             text_prefix_for_width(fonts, prefix, TextRole::Editor, metrics.editor_text_width);
-        let caret_x = (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor))
-            .min(TEXT_MARGIN_X + metrics.editor_text_width);
+        let composition_width = if Some(visible_index) == composition_visible_index {
+            fonts.measure(&gui_state.editor_ime_composition, TextRole::Editor)
+        } else {
+            0
+        };
+        let caret_x =
+            (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor) + composition_width)
+                .min(TEXT_MARGIN_X + metrics.editor_text_width);
         let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
         draw_caret(canvas, caret_x, y);
+    }
+}
+
+fn draw_editor_line_with_composition(
+    canvas: &mut Canvas,
+    fonts: &FontStack,
+    line: &VisibleLine,
+    caret_offset: usize,
+    composition: &str,
+    y: usize,
+    max_width: usize,
+) {
+    let local_offset = caret_offset
+        .saturating_sub(line.byte_range.start)
+        .min(line.text.len());
+    let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
+    let suffix = line.text.get(local_offset..).unwrap_or("");
+    let prefix = text_prefix_for_width(fonts, prefix, TextRole::Editor, max_width);
+    let prefix_width = fonts.measure(prefix, TextRole::Editor).min(max_width);
+
+    canvas.clipped_text(
+        TEXT_MARGIN_X,
+        y,
+        prefix,
+        COLOR_TEXT,
+        TextRole::Editor,
+        fonts,
+        max_width,
+    );
+
+    let composition_x = TEXT_MARGIN_X + prefix_width;
+    let remaining_width = max_width.saturating_sub(prefix_width);
+    let visible_composition =
+        text_prefix_for_width(fonts, composition, TextRole::Editor, remaining_width);
+    let composition_width = fonts
+        .measure(visible_composition, TextRole::Editor)
+        .min(remaining_width);
+    if composition_width > 0 {
+        canvas.fill_rect(
+            composition_x,
+            y,
+            composition_width.max(1),
+            EDITOR_LINE_HEIGHT,
+            COLOR_SELECTION,
+        );
+        canvas.clipped_text(
+            composition_x,
+            y,
+            visible_composition,
+            COLOR_TEXT,
+            TextRole::Editor,
+            fonts,
+            remaining_width,
+        );
+    }
+
+    let suffix_x = composition_x + composition_width;
+    let suffix_width = max_width.saturating_sub(prefix_width + composition_width);
+    if suffix_width > 0 {
+        canvas.clipped_text(
+            suffix_x,
+            y,
+            suffix,
+            COLOR_TEXT,
+            TextRole::Editor,
+            fonts,
+            suffix_width,
+        );
     }
 }
 
@@ -6420,6 +6661,78 @@ mod tests {
             y,
             editor_ime_y(metrics.text_top + TEXT_MARGIN_Y + EDITOR_LINE_HEIGHT)
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ime_set_context_filter_hides_composition_but_keeps_candidates() {
+        let flags = ime_native_composition_ui_flags();
+        let candidate_flag = windows_sys::Win32::UI::Input::Ime::ISC_SHOWUICANDIDATEWINDOW as isize;
+        let unrelated = 0x10isize;
+        let filtered = filter_ime_set_context_lparam(flags | candidate_flag | unrelated);
+
+        assert_eq!(filtered & flags, 0);
+        assert_eq!(filtered & candidate_flag, candidate_flag);
+        assert_eq!(filtered & unrelated, unrelated);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn editor_wnd_proc_consumes_composition_only_messages() {
+        let comp_only = GCS_COMPSTR as LPARAM;
+
+        assert_eq!(
+            classify_editor_ime_wnd_proc_message(WM_IME_STARTCOMPOSITION, 0),
+            Some(EditorImeWndProcAction::Consume),
+        );
+        assert_eq!(
+            classify_editor_ime_wnd_proc_message(WM_IME_ENDCOMPOSITION, 0),
+            Some(EditorImeWndProcAction::Consume),
+        );
+        assert_eq!(
+            classify_editor_ime_wnd_proc_message(WM_IME_COMPOSITION, comp_only),
+            Some(EditorImeWndProcAction::Consume),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn editor_wnd_proc_forwards_result_string_only_to_default_proc() {
+        let result_lparam = (GCS_RESULTSTR | GCS_COMPSTR) as LPARAM;
+
+        let action = classify_editor_ime_wnd_proc_message(WM_IME_COMPOSITION, result_lparam);
+
+        assert_eq!(
+            action,
+            Some(EditorImeWndProcAction::Forward(GCS_RESULTSTR as LPARAM)),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn editor_wnd_proc_passes_unrelated_messages_through() {
+        assert_eq!(classify_editor_ime_wnd_proc_message(0x0010, 0), None);
+    }
+
+    #[test]
+    fn editor_ime_candidate_position_sits_below_inline_composition() {
+        let y = editor_ime_y(text_top() + TEXT_MARGIN_Y);
+
+        assert!(editor_ime_candidate_y(y) > y);
+    }
+
+    #[test]
+    fn editor_ime_composition_is_drawn_inline_at_caret() {
+        let mut app = BlitzApp::new(EditorSettings::default());
+        app.insert_text("abcdef").expect("insert");
+        app.set_caret_offset(3).expect("caret");
+        let mut gui_state = GuiState::new().expect("gui state");
+        gui_state.editor_ime_composition = "てすと".to_owned();
+        let state = app.ui_state().expect("ui state");
+
+        let frame = render_frame_with_state(&app, &state, 640, 240, &gui_state).expect("render");
+
+        assert!(frame.pixels.iter().any(|pixel| *pixel == COLOR_SELECTION));
     }
 
     #[test]
