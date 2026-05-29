@@ -34,9 +34,12 @@ use swash::{
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
-    UI::Input::Ime::{
-        ImmGetCompositionStringW, ImmGetContext, ImmGetOpenStatus, ImmReleaseContext,
-        ImmSetCompositionWindow, CFS_FORCE_POSITION, COMPOSITIONFORM, GCS_COMPSTR,
+    UI::Input::{
+        Ime::{
+            ImmGetCompositionStringW, ImmGetContext, ImmGetOpenStatus, ImmReleaseContext,
+            ImmSetCompositionWindow, CFS_FORCE_POSITION, COMPOSITIONFORM, GCS_COMPSTR,
+        },
+        KeyboardAndMouse::{GetKeyState, VK_CONTROL},
     },
 };
 
@@ -64,6 +67,7 @@ const CARET_HEIGHT: usize = 22;
 const UI_FONT_SIZE: f32 = 15.0;
 const FIND_FONT_SIZE: f32 = 13.0;
 const EDITOR_FONT_SIZE: f32 = 18.0;
+const EDITOR_BASELINE_OFFSET: usize = 19;
 const EMOJI_FONT_SCALE: f32 = 0.68;
 const WHEEL_LINES: isize = 3;
 const HORIZONTAL_WHEEL_BYTES: isize = 96;
@@ -757,7 +761,6 @@ struct FrameSignature {
     first_visible_line: usize,
     horizontal_offset: usize,
     selected_range: Option<std::ops::Range<usize>>,
-    editor_ime_composition: String,
 }
 
 #[derive(Clone, Debug)]
@@ -786,7 +789,6 @@ fn frame_signature(
         first_visible_line: gui_state.first_visible_line,
         horizontal_offset: gui_state.horizontal_offset,
         selected_range: app.selected_range(),
-        editor_ime_composition: gui_state.editor_ime_composition.clone(),
     }
 }
 
@@ -1370,7 +1372,10 @@ fn editor_ime_caret_point(
         app.settings().word_wrap,
     );
     if visible_lines.is_empty() {
-        return Some((TEXT_MARGIN_X, metrics.text_top + TEXT_MARGIN_Y));
+        return Some((
+            TEXT_MARGIN_X,
+            editor_ime_y(metrics.text_top + TEXT_MARGIN_Y),
+        ));
     }
 
     let caret_line = app.document().line_for_offset(app.caret_offset()).ok()? + 1;
@@ -1390,8 +1395,12 @@ fn editor_ime_caret_point(
     );
     let x = (TEXT_MARGIN_X + gui_state.fonts.measure(visible_prefix, TextRole::Editor))
         .min(TEXT_MARGIN_X + metrics.editor_text_width);
-    let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
+    let y = editor_ime_y(metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT);
     Some((x, y))
+}
+
+fn editor_ime_y(line_top: usize) -> usize {
+    line_top + EDITOR_BASELINE_OFFSET
 }
 
 #[cfg(target_os = "windows")]
@@ -1405,7 +1414,7 @@ fn ime_composition_text(window: &Window) -> Option<String> {
 
         let byte_len = ImmGetCompositionStringW(context, GCS_COMPSTR, core::ptr::null_mut(), 0);
         let text = if byte_len > 0 {
-            let mut buffer = vec![0u16; byte_len as usize / 2];
+            let mut buffer = vec![0u16; (byte_len as usize).div_ceil(2)];
             let read_len = ImmGetCompositionStringW(
                 context,
                 GCS_COMPSTR,
@@ -2556,9 +2565,19 @@ fn is_command_down(window: &Window) -> bool {
     window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn is_command_down(_window: &Window) -> bool {
+    unsafe { GetKeyState(VK_CONTROL as i32) < 0 }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn is_command_down(window: &Window) -> bool {
     window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl)
+}
+
+#[cfg(test)]
+fn command_shortcuts_suppressed_for_text_input(command_down: bool) -> bool {
+    !should_handle_command_shortcuts(command_down, true, false)
 }
 
 fn is_shift_down(window: &Window) -> bool {
@@ -3951,32 +3970,17 @@ fn draw_text_area(
     let visible_lines =
         editor_visible_lines(app, first_visible_line, metrics, gui_state, state.word_wrap);
     draw_selection_highlights(canvas, app, &visible_lines, metrics, fonts);
-    let composition_visible_index = (!gui_state.editor_ime_composition.is_empty())
-        .then(|| visible_line_index_for_caret(&visible_lines, state.caret_line, app.caret_offset()))
-        .flatten();
     for (index, line) in visible_lines.iter().enumerate() {
         let y = metrics.text_top + TEXT_MARGIN_Y + index * EDITOR_LINE_HEIGHT;
-        if Some(index) == composition_visible_index {
-            draw_editor_line_with_composition(
-                canvas,
-                fonts,
-                line,
-                app.caret_offset(),
-                &gui_state.editor_ime_composition,
-                y,
-                metrics.editor_text_width,
-            );
-        } else {
-            canvas.clipped_text(
-                TEXT_MARGIN_X,
-                y,
-                &line.text,
-                COLOR_TEXT,
-                TextRole::Editor,
-                fonts,
-                metrics.editor_text_width,
-            );
-        }
+        canvas.clipped_text(
+            TEXT_MARGIN_X,
+            y,
+            &line.text,
+            COLOR_TEXT,
+            TextRole::Editor,
+            fonts,
+            metrics.editor_text_width,
+        );
     }
 
     if visible_lines.is_empty() {
@@ -3992,84 +3996,10 @@ fn draw_text_area(
         let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
         let visible_prefix =
             text_prefix_for_width(fonts, prefix, TextRole::Editor, metrics.editor_text_width);
-        let composition_width = if Some(visible_index) == composition_visible_index {
-            fonts.measure(&gui_state.editor_ime_composition, TextRole::Editor)
-        } else {
-            0
-        };
-        let caret_x =
-            (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor) + composition_width)
-                .min(TEXT_MARGIN_X + metrics.editor_text_width);
+        let caret_x = (TEXT_MARGIN_X + fonts.measure(visible_prefix, TextRole::Editor))
+            .min(TEXT_MARGIN_X + metrics.editor_text_width);
         let y = metrics.text_top + TEXT_MARGIN_Y + visible_index * EDITOR_LINE_HEIGHT;
         draw_caret(canvas, caret_x, y);
-    }
-}
-
-fn draw_editor_line_with_composition(
-    canvas: &mut Canvas,
-    fonts: &FontStack,
-    line: &VisibleLine,
-    caret_offset: usize,
-    composition: &str,
-    y: usize,
-    max_width: usize,
-) {
-    let local_offset = caret_offset
-        .saturating_sub(line.byte_range.start)
-        .min(line.text.len());
-    let prefix = line.text.get(..local_offset).unwrap_or(&line.text);
-    let suffix = line.text.get(local_offset..).unwrap_or("");
-    let prefix = text_prefix_for_width(fonts, prefix, TextRole::Editor, max_width);
-    let prefix_width = fonts.measure(prefix, TextRole::Editor).min(max_width);
-
-    canvas.clipped_text(
-        TEXT_MARGIN_X,
-        y,
-        prefix,
-        COLOR_TEXT,
-        TextRole::Editor,
-        fonts,
-        max_width,
-    );
-
-    let composition_x = TEXT_MARGIN_X + prefix_width;
-    let remaining_width = max_width.saturating_sub(prefix_width);
-    let visible_composition =
-        text_prefix_for_width(fonts, composition, TextRole::Editor, remaining_width);
-    let composition_width = fonts
-        .measure(visible_composition, TextRole::Editor)
-        .min(remaining_width);
-    if composition_width > 0 {
-        canvas.fill_rect(
-            composition_x,
-            y,
-            composition_width.max(1),
-            EDITOR_LINE_HEIGHT,
-            COLOR_SELECTION,
-        );
-        canvas.clipped_text(
-            composition_x,
-            y,
-            visible_composition,
-            COLOR_TEXT,
-            TextRole::Editor,
-            fonts,
-            remaining_width,
-        );
-    }
-
-    let suffix_x = composition_x + composition_width;
-    let suffix_width = max_width.saturating_sub(prefix_width + composition_width);
-    if suffix_width > 0 {
-        canvas.clipped_text(
-            suffix_x,
-            y,
-            suffix,
-            COLOR_TEXT,
-            TextRole::Editor,
-            fonts,
-            suffix_width,
-        );
     }
 }
 
@@ -5577,7 +5507,7 @@ impl Canvas {
             + match role {
                 TextRole::Ui => 15.0,
                 TextRole::Find => 13.0,
-                TextRole::Editor => 19.0,
+                TextRole::Editor => EDITOR_BASELINE_OFFSET as f32,
             };
         fonts.draw_text(self, x as f32, baseline, text, color, role);
     }
@@ -5596,7 +5526,7 @@ impl Canvas {
             + match role {
                 TextRole::Ui => 15.0,
                 TextRole::Find => 13.0,
-                TextRole::Editor => 19.0,
+                TextRole::Editor => EDITOR_BASELINE_OFFSET as f32,
             };
         fonts.draw_text_clipped(self, x as f32, baseline, text, color, role, max_width);
     }
@@ -5899,6 +5829,7 @@ mod tests {
         assert!(!should_handle_command_shortcuts(true, true, false));
         assert!(!should_handle_command_shortcuts(true, false, true));
         assert!(!should_handle_command_shortcuts(false, false, false));
+        assert!(command_shortcuts_suppressed_for_text_input(true));
     }
 
     #[test]
@@ -6456,7 +6387,18 @@ mod tests {
         let (x, y) = editor_ime_caret_point(&app, &gui_state, 640, 400).expect("ime point");
 
         assert!(x > TEXT_MARGIN_X);
-        assert_eq!(y, text_top() + TEXT_MARGIN_Y);
+        assert_eq!(y, editor_ime_y(text_top() + TEXT_MARGIN_Y));
+    }
+
+    #[test]
+    fn editor_ime_position_uses_baseline_in_empty_editor() {
+        let app = BlitzApp::new(EditorSettings::default());
+        let gui_state = GuiState::new().expect("gui state");
+
+        let (x, y) = editor_ime_caret_point(&app, &gui_state, 640, 400).expect("ime point");
+
+        assert_eq!(x, TEXT_MARGIN_X);
+        assert_eq!(y, editor_ime_y(text_top() + TEXT_MARGIN_Y));
     }
 
     #[test]
@@ -6474,21 +6416,10 @@ mod tests {
 
         let (_x, y) = editor_ime_caret_point(&app, &gui_state, 220, 220).expect("ime point");
 
-        assert_eq!(y, metrics.text_top + TEXT_MARGIN_Y + EDITOR_LINE_HEIGHT);
-    }
-
-    #[test]
-    fn editor_ime_composition_is_drawn_inline_at_caret() {
-        let mut app = BlitzApp::new(EditorSettings::default());
-        app.insert_text("abcdef").expect("insert");
-        app.set_caret_offset(3).expect("caret");
-        let mut gui_state = GuiState::new().expect("gui state");
-        gui_state.editor_ime_composition = "てすと".to_owned();
-        let state = app.ui_state().expect("ui state");
-
-        let frame = render_frame_with_state(&app, &state, 640, 240, &gui_state).expect("render");
-
-        assert!(frame.pixels.iter().any(|pixel| *pixel == COLOR_SELECTION));
+        assert_eq!(
+            y,
+            editor_ime_y(metrics.text_top + TEXT_MARGIN_Y + EDITOR_LINE_HEIGHT)
+        );
     }
 
     #[test]
